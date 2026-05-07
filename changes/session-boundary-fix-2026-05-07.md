@@ -113,7 +113,7 @@ Run time: ~52s
 
 ## Git commit hash
 
-_Filled in after commit._
+`11f46c5` — pushed to `origin/main`
 
 ## Notes for Ahmed
 
@@ -123,3 +123,69 @@ _Filled in after commit._
 - The DB schema was NOT changed.
 - No recording start timing was changed (still starts at ring).
 - Tests run in ~52s on this machine (PyAudio and pywinauto initialization).
+
+---
+
+# Follow-up fix — 2026-05-07 (phantom call-ended sessions + non-blocking recorder)
+
+## Root cause 1 — Phantom CALL_STARTED for "Call ended" window
+
+Live log evidence:
+- `12:34:28` OUTGOING_RING → recorder.start_recording() called synchronously
+- `12:34:54` recorder started (blocked ~26 s — WASAPI `pa.open()` exclusive mode)
+- `12:34:55` detector saw new hwnd=853328 with UIA status "Call ended"
+- Ended-by-UI guard: `(ring_event_emitted or answered_event_emitted)` → False
+  (both were reset by the hwnd-change handler at line 676)
+- Ring emission fired → `CALL_STARTED` with `is_strong_new_call=True`
+- main.py split → phantom `ringing_unknown` session with no recording
+
+## Fixes applied (detector.py)
+
+1. **Extended ended-by-UI guard** — added `or (new_window and previous_hwnd is not None)`.
+   `previous_hwnd` non-None proves a tracked session existed even after the reset.
+
+2. **ENDED_LABELS guard in ring emission** — when `not ring_event_emitted` and window
+   status is in `ENDED_LABELS`, return `DetectionResult(None, ...)` before emitting any ring.
+
+3. **Conditional `is_strong_new_call`** — `CALL_STARTED` for unknown direction gets
+   `is_strong_new_call=False` unless UIA state contains positive call proof.
+
+4. **Preserve `previous_direction`** — captured `previous_direction = self._call_direction`
+   before the hwnd-change reset; used as fallback in ENDED result so direction is not lost.
+
+## Fixes applied (main.py)
+
+5. **`weak_call_started` guard** — `CALL_STARTED` with `is_strong_new_call=False`
+   cannot split a live session; can still start a session from IDLE.
+
+6. **Non-blocking recorder start** — `_bg_start_recorder()` function runs
+   `recorder.start_recording()` in a daemon thread. Main loop checks result each
+   iteration. Logs `[REC-011]` if startup > 2 s. Join timeouts: 5 s (terminal), 3 s (split).
+
+## Files changed in this follow-up
+
+| File | Changes |
+|---|---|
+| `detector.py` | Extended ended-by-UI guard; ENDED_LABELS early-return; conditional `is_strong_new_call`; `previous_direction` fallback |
+| `main.py` | `_bg_start_recorder()` helper; background thread + result box; `weak_call_started` guard; join-before-terminal/split; thread resets |
+| `tests/test_session_lifecycle.py` | `TestPhantomCallEndedSession` (5 tests); `TestWeakCallStarted` (5 tests) |
+| `tests/test_recorder.py` | `TestRecorderBackgroundStart` (5 tests) |
+
+## Additional manual tests (beyond original checklist)
+
+9. **Recorder blocks 26 s** — simulate WASAPI lock (e.g., exclusive audio app
+   holding device). Start watcher, make an outgoing call.
+   - Expected: `[REC-011]` logged; session recorded normally once device is free;
+     no phantom "ringing_unknown" session.
+
+10. **"Call ended" window immediately** — call WhatsApp from a second device, reject
+    immediately so the window briefly shows "Call ended."
+    - Expected: ENDED emitted, no CALL_STARTED. One record with direction=outgoing/incoming.
+
+11. **Log verification (follow-up)**:
+    - `[REC-011]` must show elapsed time in seconds.
+    - No `SESSION SPLIT` must follow a window showing "Call ended" status.
+
+## Git commit hash (follow-up)
+
+TBD — commit pending push.

@@ -901,6 +901,24 @@ def _wait_for_thread_group(threads: list[threading.Thread], *, per_thread_timeou
     return stuck
 
 
+def _bg_start_recorder(recorder: "Recorder", result_box: list) -> None:
+    """Run recorder.start_recording() in a background thread.
+
+    Stores True/False in result_box[0] when done.  Logs [REC-011] if startup
+    takes more than 2 seconds (WASAPI exclusive-mode lock is the common cause).
+    """
+    t0 = time.time()
+    try:
+        ok = recorder.start_recording()
+    except Exception:
+        log.exception("RECORDER → start_recording() raised exception in background thread")
+        ok = False
+    elapsed = time.time() - t0
+    if elapsed > 2.0:
+        log.warning("[REC-011] Recording start took too long | total=%.1fs", elapsed)
+    result_box[0] = ok
+
+
 # ─── Main run loop ────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -961,6 +979,10 @@ def run() -> None:
     sync_thread: Optional[threading.Thread] = None
     cleanup_thread: Optional[threading.Thread] = None
     finalize_threads: set[threading.Thread] = set()
+    # Background recorder start — avoids blocking the detector poll loop while
+    # WASAPI/PyAudio opens audio streams (can take 5-30 s on some systems).
+    _recorder_start_thread: Optional[threading.Thread] = None
+    _recorder_start_result: list = [None]  # [True | False | None=pending/not-started]
     sync_lock = threading.Lock()
     cleanup_lock = threading.Lock()
 
@@ -1051,9 +1073,18 @@ def run() -> None:
                     else "outgoing" if result.event == CallEvent.OUTGOING_RING
                     else "unknown"
                 )
+                # A CALL_STARTED with no strong proof (unknown direction, no UIA
+                # call evidence) must not split a live session — it could be a
+                # stale or ambiguous window.  It can still start a new session
+                # from IDLE (is_live_session=False path).
+                weak_call_started = (
+                    result.event == CallEvent.CALL_STARTED
+                    and not strong_new_call
+                )
                 split_needed = (
                     is_live_session
                     and is_new_call_event
+                    and not weak_call_started
                     and (
                         different_hwnd
                         or strong_new_call
@@ -1067,6 +1098,11 @@ def run() -> None:
                 )
 
                 if split_needed:
+                    # If recorder start is still in-flight, wait briefly so we
+                    # know the true recording state before stopping/detaching.
+                    if _recorder_start_thread is not None and _recorder_start_thread.is_alive():
+                        log.warning("RECORDER → waiting for background start before split (max 3s)")
+                        _recorder_start_thread.join(timeout=3.0)
                     split_snap = copy.deepcopy(sm.session)  # snapshot before any mutation
                     old_dir = split_snap.direction or "unknown"
                     log.warning(
@@ -1088,6 +1124,8 @@ def run() -> None:
                             log.error("RECORDER → /stop failed during session split")
                     sm.transition(CallEvent.RESET)
                     current_session_hwnd = None
+                    _recorder_start_thread = None
+                    _recorder_start_result[0] = None
                     # Do NOT call detector.reset() — detector already tracks the new window.
                     _last_logged_state = None
                     if split_was_recording and split_recorder_contexts:
@@ -1204,15 +1242,15 @@ def run() -> None:
                     )
                     _last_logged_state = new_state
 
-                # ── Start recorder as early as possible ───────────────────
+                # ── Check if background recorder start finished ───────────
                 if (
-                    _should_start_recording(sm)
-                    and not recorder.is_recording
-                    and "Recorder failed to start" not in (sm.session.error_details or "")
+                    _recorder_start_thread is not None
+                    and not _recorder_start_thread.is_alive()
+                    and _recorder_start_result[0] is not None
                 ):
-                    log.info("RECORDER → starting (state=%s)", sm.state.value)
-                    started = recorder.start_recording()
-                    if started:
+                    _started = _recorder_start_result[0]
+                    _recorder_start_result[0] = None  # consumed
+                    if _started:
                         log.info("RECORDER → started successfully")
                     else:
                         sm.session.error_details = (
@@ -1221,8 +1259,30 @@ def run() -> None:
                         )
                         log.error("RECORDER → failed to start; call will be saved without recording")
 
+                # ── Start recorder as early as possible (background) ──────
+                if (
+                    _should_start_recording(sm)
+                    and not recorder.is_recording
+                    and (_recorder_start_thread is None or not _recorder_start_thread.is_alive())
+                    and "Recorder failed to start" not in (sm.session.error_details or "")
+                ):
+                    _recorder_start_result[0] = None
+                    _recorder_start_thread = threading.Thread(
+                        target=_bg_start_recorder,
+                        args=(recorder, _recorder_start_result),
+                        daemon=True,
+                        name="recorder-start",
+                    )
+                    log.info("RECORDER → starting (state=%s)", sm.state.value)
+                    _recorder_start_thread.start()
+
                 # ── Finalize on terminal state ────────────────────────────
                 if sm.is_terminal_state():
+                    # If recorder start is still pending in background, wait
+                    # briefly so we know whether recording actually started.
+                    if _recorder_start_thread is not None and _recorder_start_thread.is_alive():
+                        log.warning("RECORDER → waiting for background start before terminal finalize (max 5s)")
+                        _recorder_start_thread.join(timeout=5.0)
                     log.info(
                         "CALL END → %s | dir=%s | dur=%ss",
                         sm.state.value,
@@ -1245,6 +1305,8 @@ def run() -> None:
                     sm.transition(CallEvent.RESET)
                     detector.reset()
                     current_session_hwnd = None
+                    _recorder_start_thread = None
+                    _recorder_start_result[0] = None
                     _last_logged_state = None
 
                     # Each finalize gets its own deepcopy + contexts — safe to run concurrently

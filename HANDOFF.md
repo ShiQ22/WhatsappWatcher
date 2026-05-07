@@ -18,15 +18,18 @@ launcher.py
 ```
 result = detector.poll()
   ↓
-[split check]  if live session + new ring event + new call proof → split old session
+[split check]  if live session + new ring event + strong call proof → split old session
+               (weak CALL_STARTED — unknown dir, no UIA proof — never splits)
   ↓
 sm.transition(result.event)
   ↓
 if new ring event → current_session_hwnd = result.hwnd
   ↓
-if should record and not recording → recorder.start_recording()
+if should record and not recording → launch _bg_start_recorder() thread
   ↓
-if terminal state → stop recorder → finalize thread → sm.reset()
+check if bg recorder thread finished → log success/failure ([REC-011] if > 2 s)
+  ↓
+if terminal state → join recorder thread (max 5 s) → stop recorder → finalize → sm.reset()
 ```
 
 ## Session boundary design
@@ -44,12 +47,27 @@ Any state not in this set is "live" and subject to splitting.
 
 **Split condition (`split_needed`):**
 ```python
-is_live_session and is_new_call_event and (
-    different_hwnd          # result.hwnd != current_session_hwnd
-    or strong_new_call      # result.is_strong_new_call (always True for ring events)
-    or sm.state in (RINGING_UNKNOWN, RINGING_INCOMING, RINGING_OUTGOING, CONNECTING)
-)
+is_live_session and is_new_call_event
+    and not weak_call_started       # CALL_STARTED with is_strong_new_call=False never splits
+    and (
+        different_hwnd              # result.hwnd != current_session_hwnd
+        or strong_new_call          # result.is_strong_new_call
+        or sm.state in (RINGING_UNKNOWN, RINGING_INCOMING, RINGING_OUTGOING, CONNECTING)
+    )
 ```
+
+**`is_strong_new_call` rules (detector.py ring emission):**
+- `INCOMING_RING` / `OUTGOING_RING`: always `True`.
+- `CALL_STARTED` (direction unknown): `True` only if UIA state has `incoming`, `outgoing`,
+  `ringing`, `connecting`, `has_end_call_button`, or a known RINGING_LABELS status text.
+  Otherwise `False` — this prevents a bare unknown window from splitting a live session.
+
+**"Call ended" window guard (detector.py):**
+- If the new/current window's status text is in `ENDED_LABELS` and no ring was emitted
+  for this window, return `DetectionResult(None, ...)` — never emit `CALL_STARTED`.
+- If a session was tracked (previous hwnd non-None or ring/answered emitted), emit
+  `CallEvent.ENDED` with the old session's direction preserved via `previous_direction`
+  fallback.
 
 ### hwnd identity rules
 
@@ -71,6 +89,20 @@ is_live_session and is_new_call_event and (
 | `report.py` naming | File naming convention used by external consumers |
 | Recording start trigger | Must start at ring (not answer) to capture full call |
 | `detector.reset()` in split path | Must NOT be called; detector already tracks the new window |
+| `_recorder_start_thread` join timeouts | 5 s (terminal) / 3 s (split) — tight enough to not stall, long enough for WASAPI init |
+
+## Log codes
+
+| Code | Meaning |
+|---|---|
+| `[REC-001]` | No audio device found at recording start |
+| `[REC-002]` | `pa.open()` failed |
+| `[REC-003]` | All sample rates failed |
+| `[REC-008]` | WAV file open failure |
+| `[REC-009]` | Silence detected ≥ 6 s |
+| `[REC-011]` | `recorder.start_recording()` took > 2 s (WASAPI lock — informational) |
+| `[DEV-USB]` | USB audio device state change |
+| `[DEV-003]` | No input device |
 
 ## How to run
 

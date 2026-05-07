@@ -643,6 +643,7 @@ class WhatsAppDetector:
         sig = f"{win.hwnd}:{win.width}x{win.height}:{win.pid}"
         new_window = self._call_hwnd is None or self._call_hwnd != win.hwnd
         previous_hwnd = self._call_hwnd  # capture before any assignment so logs always show the real old value
+        previous_direction = self._call_direction  # capture before hwnd-change reset for use in ENDED result
 
         if new_window:
             if self._call_hwnd is None:
@@ -757,18 +758,26 @@ class WhatsAppDetector:
             self._last_strong_call_ui_ts = now_ts
 
         # ── Immediate ENDED when status text says call is over ────────────
-        # Guard: only fire after RING was emitted so main.py has a session to close.
+        # Guard: fire if a ring was emitted for this session OR if the hwnd
+        # just changed from a tracked session (new_window=True, previous_hwnd
+        # non-None) — covers the case where a non-answered session's hwnd changes
+        # and the new window immediately shows "Call ended" (ring_event_emitted
+        # was reset to False by the hwnd-change handler).
         if (
             state
             and state.status_text
             and _norm_label(state.status_text) in ENDED_LABELS
-            and (self._ring_event_emitted or self._answered_event_emitted)
+            and (
+                self._ring_event_emitted
+                or self._answered_event_emitted
+                or (new_window and previous_hwnd is not None)
+            )
         ):
-            direction = self._call_direction or "unknown"
+            direction = self._call_direction or previous_direction or "unknown"
             number = self._caller_number
             log.info(
-                "DETECTOR → ended by UI status | status=%s | dir=%s | number=%s",
-                state.status_text, direction, number or "-",
+                "DETECTOR → ended by UI status | status=%s | dir=%s | number=%s | hwnd=%s",
+                state.status_text, direction, number or "-", previous_hwnd or win.hwnd,
             )
             self._last_session_ended_ts = now_ts
             self._reset_internal_state()
@@ -776,7 +785,7 @@ class WhatsAppDetector:
                 CallEvent.ENDED, scan_source,
                 f"call ended by status text | dir={direction}",
                 caller_number=number, direction=direction,
-                hwnd=win.hwnd,
+                hwnd=previous_hwnd or win.hwnd,
             )
 
         # ── Stale ringing/connecting timeout ──────────────────────────────
@@ -807,6 +816,20 @@ class WhatsAppDetector:
 
         # ── Emit ring event (first time window seen) ─────────────────────
         if not self._ring_event_emitted:
+            # Never treat a "Call ended" window as a new call — return None so
+            # main.py does not create a phantom session.
+            _status_label = _norm_label(state.status_text or "") if state else ""
+            if _status_label in ENDED_LABELS:
+                log.info(
+                    "DETECTOR → ended-status window; skipping ring emission | status=%s | hwnd=%s",
+                    (state.status_text if state else "?"), win.hwnd,
+                )
+                return DetectionResult(
+                    None, scan_source if state else "detector",
+                    "ended status; ignored for ring emission",
+                    hwnd=win.hwnd,
+                    is_strong_new_call=False,
+                )
             if self._call_direction is None:
                 self._maybe_apply_direction(self._classify_direction_initial(win))
             ring_dir = self._call_direction or "unknown"
@@ -816,12 +839,24 @@ class WhatsAppDetector:
                 event = CallEvent.OUTGOING_RING
             else:
                 event = CallEvent.CALL_STARTED
+            # is_strong_new_call is True for known directions; for unknown direction
+            # require positive UIA proof (ringing/connecting/incoming/outgoing UI) —
+            # a bare unknown window without call proof is not strong evidence of a
+            # new call and must not split an existing live session in main.py.
+            _strong_proof = bool(
+                state and (
+                    state.incoming or state.outgoing or state.ringing
+                    or state.connecting or state.has_end_call_button
+                    or (state.status_text and _norm_label(state.status_text) in RINGING_LABELS)
+                )
+            )
+            _is_strong_new_call = ring_dir != "unknown" or _strong_proof
             self._ring_event_emitted = True
             if self._last_strong_call_ui_ts <= 0.0:
                 self._last_strong_call_ui_ts = now_ts
             log.info(
-                "DETECTOR → ring emitted | dir=%s | hwnd=%s | scan=%s",
-                ring_dir, win.hwnd, scan_source if state else "none",
+                "DETECTOR → ring emitted | dir=%s | hwnd=%s | scan=%s | strong=%s",
+                ring_dir, win.hwnd, scan_source if state else "none", _is_strong_new_call,
             )
             return DetectionResult(
                 event,
@@ -831,7 +866,7 @@ class WhatsAppDetector:
                 direction=self._call_direction or "unknown",
                 hwnd=win.hwnd,
                 is_new_window=new_window,
-                is_strong_new_call=True,
+                is_strong_new_call=_is_strong_new_call,
             )
 
         # ── Lock answered state when timer proof seen ────────────────────

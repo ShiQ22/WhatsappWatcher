@@ -35,15 +35,33 @@ Back-to-back WhatsApp calls could merge into one record/recording.
 ### Final design
 - **Session identity = hwnd** of the WhatsApp call window.
 - Every `DetectionResult` while a call window exists carries `hwnd=win.hwnd`.
-- Ring events (`INCOMING_RING`, `OUTGOING_RING`, `CALL_STARTED`) carry
-  `is_strong_new_call=True`. `ANSWERED` does not.
-- `previous_hwnd = self._call_hwnd` is saved before the `if new_window:` block
-  in `detector.poll()` so all logs see the real old value.
+- Ring events (`INCOMING_RING`, `OUTGOING_RING`) always carry `is_strong_new_call=True`.
+- `CALL_STARTED` (unknown direction): `is_strong_new_call=True` only when UIA state
+  shows positive proof (`incoming`/`outgoing`/`ringing`/`connecting`/`has_end_call_button`
+  or a RINGING_LABELS status text). Without proof → `False` (cannot split live session).
+- `ANSWERED` carries `hwnd` but not `is_strong_new_call=True`.
+- `previous_hwnd = self._call_hwnd` and `previous_direction = self._call_direction`
+  are saved before the `if new_window:` block in `detector.poll()`.
 - `main.py` `_TERMINAL_STATES = {IDLE, ENDED, RECORDER_ERROR, DETECTOR_ERROR}`.
   Any other state is "live"; a new ring event while live triggers a split.
-- Split path: deepcopy old session → stop/detach recorder → finalize thread →
-  `sm.transition(RESET)` → clear `current_session_hwnd`. Does **not** call
-  `detector.reset()`.
+  **A weak CALL_STARTED (`is_strong_new_call=False`) never triggers a split.**
+- Split path: join recorder thread (3 s) → deepcopy old session → stop/detach recorder →
+  finalize thread → `sm.transition(RESET)` → clear `current_session_hwnd`.
+  Does **not** call `detector.reset()`.
+
+### "Call ended" window defense (fixed 2026-05-07 follow-up)
+When the detector sees a window whose UIA status is in `ENDED_LABELS`:
+1. If `ring_event_emitted or answered_event_emitted or (new_window and previous_hwnd is not None)` →
+   emit `ENDED` with `direction = self._call_direction or previous_direction or "unknown"`.
+2. Else (first window ever, showing "Call ended") → return `DetectionResult(None, ...)`.
+3. Ring emission block: if `not ring_event_emitted` and status in `ENDED_LABELS` → return
+   `DetectionResult(None, ...)` before emitting any ring.
+
+### Non-blocking recorder start (fixed 2026-05-07 follow-up)
+`recorder.start_recording()` runs in a daemon thread via `_bg_start_recorder()`.
+Main loop checks `_recorder_start_thread.is_alive()` and `_recorder_start_result[0]`
+each iteration.  Join timeouts: 5 s before terminal finalize, 3 s before split.
+`[REC-011]` logged if startup > 2 s.
 
 ## USB selection behavior
 
@@ -83,6 +101,7 @@ Back-to-back WhatsApp calls could merge into one record/recording.
 | `[REC-008]` | WAV file open failed |
 | `[REC-009]` | Silence detected for >6s during recording |
 | `[REC-010]` | Written frames < 70% of expected (timing/buffer issue) |
+| `[REC-011]` | `recorder.start_recording()` in background thread took > 2 s (WASAPI lock) |
 | `[DEV-003]` | Zero input devices enumerated |
 | `[DEV-USB]` | USB headset connect/disconnect/selection event |
 | `[UPL-001]` | Unhandled exception in `process_pending_uploads` |

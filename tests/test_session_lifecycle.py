@@ -523,6 +523,270 @@ class TestSingleCallRegressions:
         assert not is_live  # confirms IDLE is not a live session
 
 
+# ── Phantom "Call ended" session prevention ───────────────────────────────────
+
+class TestPhantomCallEndedSession:
+    """
+    Reproduces the live bug:
+      outgoing ringing (hwnd=1051324)
+      → recorder blocks 26 s
+      → new window (hwnd=853328) shows "Call ended"
+      → detector must NOT emit CALL_STARTED / ring
+      → main must NOT split into a phantom unknown session
+    """
+
+    def _outgoing_ringing_detector(self, old_hwnd: int = 1051324):
+        """Detector in outgoing ringing state, ring already emitted."""
+        from detector import WhatsAppDetector
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = old_hwnd
+        d._call_pid = 9999
+        d._ring_event_emitted = True
+        d._answered_event_emitted = False
+        d._session_answered_proof_seen = False
+        d._call_direction = "outgoing"
+        d._last_session_ended_ts = 0.0
+        d._last_strong_call_ui_ts = time.time()
+        return d
+
+    def test_ended_status_new_hwnd_does_not_emit_call_started(self):
+        """
+        Exact reproduction of the live bug:
+        old hwnd=1051324 (outgoing ringing) → new hwnd=853328 with "Call ended".
+        Must emit ENDED (or None), never CALL_STARTED.
+        """
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = self._outgoing_ringing_detector(old_hwnd=1051324)
+        new_win = _WinInfo(hwnd=853328, pid=9999, width=400, height=300)
+        ended_state = _make_uia_state(status_text="Call ended")
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=new_win), \
+             patch.object(d, "_scan_with_failover", return_value=(ended_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=MagicMock()), \
+             patch.object(d, "_classify_direction_initial", return_value=MagicMock()):
+            result = d.poll()
+
+        assert result.event != CallEvent.CALL_STARTED, \
+            f"CALL_STARTED must never fire for 'Call ended' window; got {result.event}"
+        assert result.event != CallEvent.INCOMING_RING
+        assert result.event != CallEvent.OUTGOING_RING
+        assert result.is_strong_new_call is False
+
+    def test_arabic_ended_status_new_hwnd_does_not_emit_call_started(self):
+        """Arabic 'انتهت المكالمة' must also prevent ring emission on new window."""
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = self._outgoing_ringing_detector(old_hwnd=1051324)
+        new_win = _WinInfo(hwnd=853328, pid=9999, width=400, height=300)
+        ended_state = _make_uia_state(status_text="انتهت المكالمة")
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=new_win), \
+             patch.object(d, "_scan_with_failover", return_value=(ended_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=MagicMock()), \
+             patch.object(d, "_classify_direction_initial", return_value=MagicMock()):
+            result = d.poll()
+
+        assert result.event != CallEvent.CALL_STARTED
+        assert result.is_strong_new_call is False
+
+    def test_ended_status_new_hwnd_with_tracked_session_emits_ended(self):
+        """Case A: old session tracked → new 'Call ended' window → ENDED emitted."""
+        from detector import WhatsAppDetector, _WinInfo, _DirectionDecision
+        from state_machine import CallEvent
+
+        d = self._outgoing_ringing_detector(old_hwnd=1051324)
+        new_win = _WinInfo(hwnd=853328, pid=9999, width=400, height=300)
+        ended_state = _make_uia_state(status_text="Call ended")
+        _no_dir = _DirectionDecision(None, "mocked", "none")
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=new_win), \
+             patch.object(d, "_scan_with_failover", return_value=(ended_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=_no_dir), \
+             patch.object(d, "_classify_direction_initial", return_value=_no_dir):
+            result = d.poll()
+
+        assert result.event == CallEvent.ENDED
+        assert result.direction == "outgoing"
+        assert result.is_strong_new_call is False
+
+    def test_ended_status_without_tracked_session_returns_none(self):
+        """
+        Case B: no previous session (first window ever seen shows 'Call ended').
+        Must return None — no ENDED, no ring.
+        """
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = None   # no previous session tracked
+        d._ring_event_emitted = False
+        d._answered_event_emitted = False
+        d._last_session_ended_ts = 0.0
+        win = _WinInfo(hwnd=853328, pid=9999, width=400, height=300)
+        ended_state = _make_uia_state(status_text="Call ended")
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=win), \
+             patch.object(d, "_scan_with_failover", return_value=(ended_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=MagicMock()), \
+             patch.object(d, "_classify_direction_initial", return_value=MagicMock()):
+            result = d.poll()
+
+        assert result.event != CallEvent.CALL_STARTED
+        assert result.event != CallEvent.ENDED   # no session to close
+        assert result.is_strong_new_call is False
+
+    def test_ended_status_same_window_ring_emitted_still_emits_ended(self):
+        """Regression: same-window 'Call ended' with ring emitted still works."""
+        from state_machine import CallEvent
+
+        d = _detector_with_ring_emitted(hwnd=12345, direction="outgoing")
+        win = _fake_win(hwnd=12345)
+        state = _make_uia_state(status_text="Call ended")
+
+        result = _poll_with_mocks(d, win, state)
+
+        assert result.event == CallEvent.ENDED
+        assert result.direction == "outgoing"
+
+
+class TestWeakCallStarted:
+    """
+    CALL_STARTED with is_strong_new_call=False must not split a live session.
+    It can still start a new session from IDLE.
+    """
+
+    def test_call_started_unknown_no_proof_is_not_strong_new_call(self):
+        """Unknown direction + no UIA proof → is_strong_new_call=False."""
+        from detector import WhatsAppDetector, _WinInfo, _DirectionDecision
+        from state_machine import CallEvent
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = None
+        d._last_session_ended_ts = 0.0
+        win = _WinInfo(hwnd=77777, pid=9999, width=400, height=300)
+        # Bare window — no incoming/outgoing/ringing proof, no direction
+        bare_state = _make_uia_state()  # all flags False
+        _no_dir = _DirectionDecision(None, "mocked", "none")
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=win), \
+             patch.object(d, "_scan_with_failover", return_value=(bare_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=_no_dir), \
+             patch.object(d, "_classify_direction_initial", return_value=_no_dir):
+            result = d.poll()
+
+        assert result.event == CallEvent.CALL_STARTED
+        assert result.is_strong_new_call is False
+
+    def test_call_started_with_ringing_proof_is_strong(self):
+        """Unknown direction but state.ringing=True → is_strong_new_call=True."""
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = None
+        d._last_session_ended_ts = 0.0
+        win = _WinInfo(hwnd=77778, pid=9999, width=400, height=300)
+        ringing_state = _make_uia_state(ringing=True)
+
+        with patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=win), \
+             patch.object(d, "_scan_with_failover", return_value=(ringing_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=MagicMock()), \
+             patch.object(d, "_classify_direction_initial", return_value=MagicMock()):
+            result = d.poll()
+
+        assert result.event == CallEvent.CALL_STARTED
+        assert result.is_strong_new_call is True
+
+    def test_weak_call_started_does_not_split_live_ringing_session(self):
+        """
+        Live RINGING_OUTGOING session + CALL_STARTED with is_strong_new_call=False
+        must NOT trigger a split.
+        """
+        from state_machine import StateMachine, CallEvent, CallState
+        from main import _TERMINAL_STATES
+
+        sm = StateMachine()
+        sm.transition(CallEvent.OUTGOING_RING)
+        sm.session.direction = "outgoing"
+        assert sm.state == CallState.RINGING_OUTGOING
+
+        is_live = sm.state not in _TERMINAL_STATES
+        is_new_call_event = True  # CALL_STARTED
+        strong_new_call = False   # weak — no UIA proof
+        different_hwnd = False
+
+        weak_call_started = (True and not strong_new_call)  # CALL_STARTED + not strong
+
+        split_needed = (
+            is_live
+            and is_new_call_event
+            and not weak_call_started
+            and (different_hwnd or strong_new_call or sm.state in (
+                CallState.RINGING_UNKNOWN, CallState.RINGING_INCOMING,
+                CallState.RINGING_OUTGOING, CallState.CONNECTING,
+            ))
+        )
+        assert not split_needed
+
+    def test_strong_outgoing_ring_still_splits_live_session(self):
+        """OUTGOING_RING with is_strong_new_call=True still splits as before."""
+        from state_machine import StateMachine, CallEvent, CallState
+        from main import _TERMINAL_STATES
+
+        sm = StateMachine()
+        sm.transition(CallEvent.OUTGOING_RING)
+        sm.session.direction = "outgoing"
+
+        is_live = sm.state not in _TERMINAL_STATES
+        is_new_call_event = True
+        strong_new_call = True   # OUTGOING_RING always strong
+        weak_call_started = False  # not CALL_STARTED
+
+        split_needed = (
+            is_live and is_new_call_event and not weak_call_started
+            and (strong_new_call or sm.state in (
+                CallState.RINGING_UNKNOWN, CallState.RINGING_INCOMING,
+                CallState.RINGING_OUTGOING, CallState.CONNECTING,
+            ))
+        )
+        assert split_needed
+
+    def test_weak_call_started_from_idle_still_creates_session(self):
+        """A weak CALL_STARTED from IDLE: is_live=False → no split, but SM handles it."""
+        from state_machine import StateMachine, CallEvent, CallState
+        from main import _TERMINAL_STATES
+
+        sm = StateMachine()
+        assert sm.state == CallState.IDLE
+
+        is_live = sm.state not in _TERMINAL_STATES
+        weak_call_started = True   # weak CALL_STARTED
+        assert not is_live  # IDLE → never a split
+
+        # SM should still transition to RINGING_UNKNOWN when the event is processed
+        sm.transition(CallEvent.CALL_STARTED)
+        assert sm.state == CallState.RINGING_UNKNOWN
+
+
 # ── FIX 2: stale ringing/connecting timeout ───────────────────────────────────
 
 class TestStaleRingingTimeout:

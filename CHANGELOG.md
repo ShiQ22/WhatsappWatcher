@@ -58,6 +58,77 @@ correct and required no changes.
 
 **Total test count: 165 passed, 0 failed.**
 
+---
+
+## 2026-05-07 follow-up — Phantom call-ended sessions + non-blocking recorder
+
+### Problems fixed
+
+**Bug A — phantom "Call ended" session (live production log):**
+After `recorder.start_recording()` blocked the poll loop for ~26 s (WASAPI
+exclusive mode on a USB device), the detector saw a new hwnd=853328 already
+showing UIA status "Call ended."  The ended-by-UI guard
+`(ring_event_emitted or answered_event_emitted)` evaluated to `False` (both
+had been reset by the hwnd-change handler).  Ring emission fired
+unconditionally, emitting `CALL_STARTED` with `is_strong_new_call=True`.
+`main.py` split the live outgoing session and created a phantom
+`ringing_unknown` call that finalized with no recording file.
+
+**Bug B — blocking recorder start (WASAPI lock):**
+`recorder.start_recording()` → `CaptureEngine.start()` → `pa.open()`
+(exclusive mode) blocked the main poll loop for 10–30 s.  Any events that
+occurred during that window were missed entirely.
+
+### Root causes & fixes
+
+| Layer | Change |
+|---|---|
+| `detector.py` — extended ended-by-UI guard | Added `or (new_window and previous_hwnd is not None)` to the guard — when hwnd changes during a non-answered session `ring_event_emitted` is reset before the check, but `previous_hwnd` non-None proves a tracked session existed |
+| `detector.py` — ENDED_LABELS guard in ring emission | Early return when `not ring_event_emitted` and the new window's status is already in `ENDED_LABELS` (handles Case B: first window ever shows "Call ended") |
+| `detector.py` — conditional `is_strong_new_call` | Unknown-direction ring with no UIA proof (`incoming`/`outgoing`/`ringing`/`connecting`/`has_end_call_button`/`RINGING_LABELS`) gets `is_strong_new_call=False` |
+| `detector.py` — preserve `previous_direction` | Captured `previous_direction = self._call_direction` before the hwnd-change reset; used as fallback in ENDED result so direction is not lost |
+| `main.py` — `weak_call_started` guard | `CALL_STARTED` with `is_strong_new_call=False` cannot split a live session; can still start a session from IDLE |
+| `main.py` — background recorder start | `_bg_start_recorder()` helper runs `recorder.start_recording()` in a daemon thread; main loop checks result each iteration; logs `[REC-011]` if startup > 2 s |
+| `main.py` — join-before-finalize | Before terminal-state finalization: `_recorder_start_thread.join(timeout=5.0)` |
+| `main.py` — join-before-split | Before session split: `_recorder_start_thread.join(timeout=3.0)` |
+
+### Files changed
+
+| File | Change |
+|---|---|
+| `detector.py` | Extended ended-by-UI guard; ENDED_LABELS early-return; conditional `is_strong_new_call`; `previous_direction` fallback in ENDED result |
+| `main.py` | `_bg_start_recorder()` function; background thread vars; `weak_call_started` split guard; join-before-terminal/split; thread reset after terminal/split |
+| `tests/test_session_lifecycle.py` | New `TestPhantomCallEndedSession` (5 tests); new `TestWeakCallStarted` (5 tests) |
+| `tests/test_recorder.py` | New `TestRecorderBackgroundStart` (5 tests, incl. [REC-011]) |
+
+### Behavior now guaranteed
+
+- A "Call ended" window (any hwnd, any language) never emits `CALL_STARTED`.
+- An unknown-direction ring with no UIA proof never splits a live session.
+- `recorder.start_recording()` never blocks the detector poll loop.
+- If recorder startup takes > 2 s, `[REC-011]` is logged with elapsed time.
+- `_bg_start_recorder()` absorbs any exception, stores False, never re-raises.
+
+### Tests added (15 new — total: 180 passed, 0 failed)
+
+| Test | Verifies |
+|---|---|
+| `TestPhantomCallEndedSession::test_ended_status_new_hwnd_does_not_emit_call_started` | Exact live-bug reproduction: old hwnd→new "Call ended" hwnd never fires CALL_STARTED |
+| `TestPhantomCallEndedSession::test_arabic_ended_status_new_hwnd_does_not_emit_call_started` | Arabic "انتهت المكالمة" also blocked |
+| `TestPhantomCallEndedSession::test_ended_status_new_hwnd_with_tracked_session_emits_ended` | Case A: old session → new "Call ended" hwnd → ENDED with correct direction |
+| `TestPhantomCallEndedSession::test_ended_status_without_tracked_session_returns_none` | Case B: first window ever shows "Call ended" → None (no ENDED, no ring) |
+| `TestPhantomCallEndedSession::test_ended_status_same_window_ring_emitted_still_emits_ended` | Regression: same-window existing behavior preserved |
+| `TestWeakCallStarted::test_call_started_unknown_no_proof_is_not_strong_new_call` | Bare window, no proof → `is_strong_new_call=False` |
+| `TestWeakCallStarted::test_call_started_with_ringing_proof_is_strong` | `state.ringing=True` → `is_strong_new_call=True` |
+| `TestWeakCallStarted::test_weak_call_started_does_not_split_live_ringing_session` | Weak CALL_STARTED cannot split a live session in main.py |
+| `TestWeakCallStarted::test_strong_outgoing_ring_still_splits_live_session` | Strong OUTGOING_RING still splits correctly |
+| `TestWeakCallStarted::test_weak_call_started_from_idle_still_creates_session` | Weak CALL_STARTED from IDLE starts a new session (no split) |
+| `TestRecorderBackgroundStart::test_bg_start_recorder_stores_true_on_success` | Success path stores True in result_box |
+| `TestRecorderBackgroundStart::test_bg_start_recorder_stores_false_on_failure` | Failure path stores False |
+| `TestRecorderBackgroundStart::test_bg_start_recorder_stores_false_on_exception` | Exception path stores False, no re-raise |
+| `TestRecorderBackgroundStart::test_bg_start_recorder_logs_rec011_when_slow` | Elapsed > 2 s → [REC-011] logged |
+| `TestRecorderBackgroundStart::test_bg_start_recorder_does_not_log_rec011_when_fast` | Elapsed ≤ 2 s → [REC-011] not logged |
+
 ### Manual verification checklist
 After deploying, Ahmed should run these manual tests:
 

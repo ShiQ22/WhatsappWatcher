@@ -568,3 +568,82 @@ def _ctx_for(output_dir: Path, wav_path: Path) -> RecordingContext:
         segment_index=1,
         output_path=str(wav_path),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background recorder start helper (_bg_start_recorder / [REC-011])
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRecorderBackgroundStart:
+    """Tests for _bg_start_recorder() in main.py and [REC-011] timing log."""
+
+    def _import_bg(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from main import _bg_start_recorder
+        return _bg_start_recorder
+
+    def test_bg_start_recorder_stores_true_on_success(self):
+        """start_recording() returns True → result_box[0] = True."""
+        _bg_start_recorder = self._import_bg()
+        recorder = MagicMock()
+        recorder.start_recording.return_value = True
+        result_box = [None]
+        _bg_start_recorder(recorder, result_box)
+        assert result_box[0] is True
+
+    def test_bg_start_recorder_stores_false_on_failure(self):
+        """start_recording() returns False → result_box[0] = False."""
+        _bg_start_recorder = self._import_bg()
+        recorder = MagicMock()
+        recorder.start_recording.return_value = False
+        result_box = [None]
+        _bg_start_recorder(recorder, result_box)
+        assert result_box[0] is False
+
+    def test_bg_start_recorder_stores_false_on_exception(self):
+        """start_recording() raises → result_box[0] = False, no re-raise."""
+        _bg_start_recorder = self._import_bg()
+        recorder = MagicMock()
+        recorder.start_recording.side_effect = OSError("device busy")
+        result_box = [None]
+        _bg_start_recorder(recorder, result_box)   # must not raise
+        assert result_box[0] is False
+
+    def test_bg_start_recorder_logs_rec011_when_slow(self, caplog):
+        """Startup > 2s → [REC-011] warning is logged."""
+        import logging
+        _bg_start_recorder = self._import_bg()
+        recorder = MagicMock()
+
+        def _slow_start():
+            time.sleep(0.01)
+            return True
+
+        recorder.start_recording.side_effect = _slow_start
+        result_box = [None]
+
+        with patch("main.time") as mock_time:
+            mock_time.time.side_effect = [0.0, 3.5]   # elapsed = 3.5 s
+            with caplog.at_level(logging.WARNING, logger="watcher.main"):
+                _bg_start_recorder(recorder, result_box)
+
+        assert any("REC-011" in r.message for r in caplog.records), \
+            "[REC-011] warning must be logged when elapsed > 2s"
+
+    def test_bg_start_recorder_does_not_log_rec011_when_fast(self, caplog):
+        """Startup < 2s → no [REC-011] warning."""
+        import logging
+        _bg_start_recorder = self._import_bg()
+        recorder = MagicMock()
+        recorder.start_recording.return_value = True
+        result_box = [None]
+
+        with patch("main.time") as mock_time:
+            mock_time.time.side_effect = [0.0, 0.5]   # elapsed = 0.5 s
+            with caplog.at_level(logging.WARNING, logger="watcher.main"):
+                _bg_start_recorder(recorder, result_box)
+
+        assert not any("REC-011" in r.message for r in caplog.records), \
+            "[REC-011] must NOT be logged when elapsed <= 2s"
