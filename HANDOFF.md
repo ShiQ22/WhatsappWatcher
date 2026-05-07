@@ -25,12 +25,19 @@ sm.transition(result.event)
   ↓
 if new ring event → current_session_hwnd = result.hwnd
   ↓
-if should record and not recording → launch _bg_start_recorder() thread
+if should record and not recording → recorder.start_recording() [synchronous, fast]
+  [REC-011] logged if start takes > 2 s
   ↓
-check if bg recorder thread finished → log success/failure ([REC-011] if > 2 s)
+[REC-012] orphan guard — if recorder running and no live session → stop + finalize immediately
   ↓
-if terminal state → join recorder thread (max 5 s) → stop recorder → finalize → sm.reset()
+if terminal state → stop recorder → finalize → sm.reset()
 ```
+
+**Recorder lifecycle ownership rule:**
+`main.py` owns recorder lifecycle synchronously.  `start_recording()` is called
+inline in the poll loop — never in a background thread.  When the session resets
+or splits, the recorder is already either stopped or not yet started.  There is no
+window where a background start can create an orphan recording.
 
 ## Session boundary design
 
@@ -89,7 +96,8 @@ is_live_session and is_new_call_event
 | `report.py` naming | File naming convention used by external consumers |
 | Recording start trigger | Must start at ring (not answer) to capture full call |
 | `detector.reset()` in split path | Must NOT be called; detector already tracks the new window |
-| `_recorder_start_thread` join timeouts | 5 s (terminal) / 3 s (split) — tight enough to not stall, long enough for WASAPI init |
+| Async recorder start | Must NOT reintroduce unless it includes a session token/cancel mechanism. Previous async start caused orphan recordings when the session reset while start was in-flight. |
+| `_do_mute_check` in bg thread | Must remain in daemon thread — UIA traversal takes 20-30 s and must never block `start_recording()` return |
 
 ## Log codes
 
@@ -100,7 +108,8 @@ is_live_session and is_new_call_event
 | `[REC-003]` | All sample rates failed |
 | `[REC-008]` | WAV file open failure |
 | `[REC-009]` | Silence detected ≥ 6 s |
-| `[REC-011]` | `recorder.start_recording()` took > 2 s (WASAPI lock — informational) |
+| `[REC-011]` | `recorder.start_recording()` engine or context phase took > 2 s (WASAPI exclusive lock) |
+| `[REC-012]` | Orphan recorder guard fired — recorder was running with no live session; stopped immediately |
 | `[DEV-USB]` | USB audio device state change |
 | `[DEV-003]` | No input device |
 

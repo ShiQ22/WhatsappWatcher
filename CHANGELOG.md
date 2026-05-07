@@ -1,5 +1,71 @@
 # Changelog
 
+## 2026-05-07 final — Synchronous fast recorder start, orphan guard, log cap
+
+### Problem fixed
+
+After the previous async recorder start change, back-to-back calls became worse:
+- Two calls ended up in one recording.
+- Recording did not finalize until app was aborted.
+- Final file was named "unknown".
+- State/session was lost between calls.
+- Recorder kept running after the real call was over.
+
+### Root cause: recorder lifecycle ownership broken by async start
+
+`_bg_start_recorder()` ran `recorder.start_recording()` in a daemon thread.
+If the detector ended or the session was reset while that thread was still in
+`CaptureEngine.start()` → `pa.open()`, main.py would reset the session and
+clear `current_session_hwnd`.  The background thread then completed later,
+set `recorder._is_recording = True`, and created an active recording with no
+valid live session — an **orphan recorder**.
+
+The orphan recorder kept running until app shutdown.  At shutdown, finalization
+used the stale (post-reset, IDLE) session state — giving the recording the
+direction "unknown" and merging audio from multiple calls into one file.
+
+### Why `_check_whatsapp_mute()` was the actual slow path
+
+The original `start_recording()` blocked because it called `_do_mute_check()`
+synchronously, which calls `_check_whatsapp_mute()` → `Desktop(backend="uia")`
+→ `desktop.windows(...)` → `win.descendants(control_type="Button")`.
+Full UIA tree traversal on the active WhatsApp window takes 20–30 s.
+
+### Fixes
+
+| Fix | File | Change |
+|---|---|---|
+| Remove async recorder start | `main.py` | Deleted `_bg_start_recorder()`, `_recorder_start_thread`, `_recorder_start_result`, join-before-split, join-before-terminal |
+| Synchronous recorder start with timing | `main.py` | Inline `recorder.start_recording()` with `time.monotonic()` wrapper; logs `[REC-011]` if > 2 s |
+| Move mute check to background thread | `recorder.py` | `_do_mute_check()` runs in a daemon thread started after `engine.start()` |
+| Phase timing in start_recording | `recorder.py` | Logs `REC → start timing | total=...s | engine=...s | context=...s`; `[REC-011]` per slow phase |
+| Orphan recorder guard | `main.py` | `[REC-012]` fires if `recorder.is_recording` and not `_should_start_recording(sm)` — stops recorder and finalizes immediately |
+| Log file handler to INFO | `main.py` | File handler now respects `LOG_LEVEL` from config (default INFO, not DEBUG) |
+| Log rotation cap | `config.py` | `log_backup_count` default raised to 5; `log_level` config option added |
+
+### Behavior now guaranteed
+
+- `recorder.start_recording()` returns in < 2 s under normal conditions (no WASAPI exclusive lock).
+- If engine open blocks > 2 s, `[REC-011]` identifies the exact phase.
+- Mute check is purely informational; never blocks call recording.
+- main.py owns recorder lifecycle synchronously: if session resets, recorder is already stopped or never started.
+- `[REC-012]` orphan guard is a last-resort safety net; should never fire after this fix.
+- Log files cap at ~25 MB total (5 × 5 MB files) at INFO level.
+- `log_level: "DEBUG"` in config.json re-enables verbose debug logging.
+
+### Manual verification checklist
+
+1. Single outgoing call → one file, direction=outgoing, finalizes without closing app, no unknown file, no `[REC-012]`.
+2. Single incoming call → one file, direction=incoming, finalizes normally.
+3. Outgoing → incoming back-to-back → two separate files, no merged recording, old call finalized before new recorder starts.
+4. Outgoing → outgoing → two separate files, no unknown.
+5. Incoming → incoming → two separate files, no unknown.
+6. Leave app running 30 min → log files rotate, total size stays bounded.
+7. Log must show `REC → start timing | total=` within 2 s of call start.
+8. No `[REC-012]` in normal operation.
+
+---
+
 ## 2026-05-07 — Fix back-to-back call session boundaries
 
 ### Problem fixed

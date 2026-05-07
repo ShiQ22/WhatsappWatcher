@@ -189,3 +189,50 @@ Live log evidence:
 ## Git commit hash (follow-up)
 
 `1419259` — pushed to `origin/main`
+
+---
+
+# Final lifecycle fix — 2026-05-07 (synchronous fast recorder start)
+
+## Why async recorder start was wrong
+
+`_bg_start_recorder()` ran `recorder.start_recording()` in a daemon thread.
+If `detector.poll()` returned ENDED or RESET while the thread was inside
+`CaptureEngine.start()` → `pa.open()`, main.py reset `current_session_hwnd`
+and called `sm.transition(RESET)`.  The daemon thread then completed, set
+`recorder._is_recording = True`, and created an active recording attached
+to the post-reset (IDLE) session — an **orphan recorder**.
+
+## Why that caused unknown files and merged calls
+
+The orphan recorder kept recording through the entire next call and until
+shutdown.  At shutdown, finalization used the stale IDLE session state
+(direction="unknown").  Audio from multiple back-to-back calls merged into
+one file.
+
+## Why `_check_whatsapp_mute()` was the actual slow path
+
+`start_recording()` called `_do_mute_check()` synchronously.
+`_do_mute_check()` calls `_check_whatsapp_mute()` which does
+`Desktop(backend="uia").windows(...)` + `win.descendants(control_type="Button")` —
+full UIA tree traversal: 20–30 s on systems with many UI elements.
+
+## Correct design: synchronous fast recorder start
+
+1. `recorder.start_recording()` is called inline in the poll loop.
+2. `_do_mute_check()` runs in a daemon thread (purely informational).
+3. `[REC-011]` logged if engine or context phase > 2 s.
+4. `[REC-012]` orphan guard stops any recorder running without a live session.
+5. Log file handler set to INFO by default (was DEBUG); `log_backup_count` = 5.
+
+## Files changed
+
+| File | Change |
+|---|---|
+| `main.py` | Removed `_bg_start_recorder`, async thread vars, join-before-split/terminal; inline synchronous start with `[REC-011]` timing; `[REC-012]` orphan guard; `LOG_LEVEL` import/use for file handler |
+| `recorder.py` | `_do_mute_check` moved to daemon thread; `_t0` / phase timing; `[REC-011]` per slow phase |
+| `config.py` | `log_backup_count` default = 5; `log_level` config key added; `LOG_LEVEL` exported |
+
+## Git commit hash (final lifecycle fix)
+
+TBD — commit pending push.

@@ -26,6 +26,7 @@ from config import (
     LOCAL_CLEANUP_INTERVAL_SECONDS,
     LOG_BACKUP_COUNT,
     LOG_DIR,
+    LOG_LEVEL,
     LOG_MAX_BYTES,
     POLL_INTERVAL_SECONDS,
     STARTUP_PENDING_UPLOAD_SCAN,
@@ -54,7 +55,7 @@ file_handler = RotatingFileHandler(
     backupCount=LOG_BACKUP_COUNT,
     encoding="utf-8",
 )
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 file_handler.setFormatter(formatter)
 
 console_handler = logging.StreamHandler()
@@ -901,23 +902,6 @@ def _wait_for_thread_group(threads: list[threading.Thread], *, per_thread_timeou
     return stuck
 
 
-def _bg_start_recorder(recorder: "Recorder", result_box: list) -> None:
-    """Run recorder.start_recording() in a background thread.
-
-    Stores True/False in result_box[0] when done.  Logs [REC-011] if startup
-    takes more than 2 seconds (WASAPI exclusive-mode lock is the common cause).
-    """
-    t0 = time.time()
-    try:
-        ok = recorder.start_recording()
-    except Exception:
-        log.exception("RECORDER → start_recording() raised exception in background thread")
-        ok = False
-    elapsed = time.time() - t0
-    if elapsed > 2.0:
-        log.warning("[REC-011] Recording start took too long | total=%.1fs", elapsed)
-    result_box[0] = ok
-
 
 # ─── Main run loop ────────────────────────────────────────────────────────────
 
@@ -979,10 +963,6 @@ def run() -> None:
     sync_thread: Optional[threading.Thread] = None
     cleanup_thread: Optional[threading.Thread] = None
     finalize_threads: set[threading.Thread] = set()
-    # Background recorder start — avoids blocking the detector poll loop while
-    # WASAPI/PyAudio opens audio streams (can take 5-30 s on some systems).
-    _recorder_start_thread: Optional[threading.Thread] = None
-    _recorder_start_result: list = [None]  # [True | False | None=pending/not-started]
     sync_lock = threading.Lock()
     cleanup_lock = threading.Lock()
 
@@ -1098,11 +1078,6 @@ def run() -> None:
                 )
 
                 if split_needed:
-                    # If recorder start is still in-flight, wait briefly so we
-                    # know the true recording state before stopping/detaching.
-                    if _recorder_start_thread is not None and _recorder_start_thread.is_alive():
-                        log.warning("RECORDER → waiting for background start before split (max 3s)")
-                        _recorder_start_thread.join(timeout=3.0)
                     split_snap = copy.deepcopy(sm.session)  # snapshot before any mutation
                     old_dir = split_snap.direction or "unknown"
                     log.warning(
@@ -1124,8 +1099,6 @@ def run() -> None:
                             log.error("RECORDER → /stop failed during session split")
                     sm.transition(CallEvent.RESET)
                     current_session_hwnd = None
-                    _recorder_start_thread = None
-                    _recorder_start_result[0] = None
                     # Do NOT call detector.reset() — detector already tracks the new window.
                     _last_logged_state = None
                     if split_was_recording and split_recorder_contexts:
@@ -1242,47 +1215,71 @@ def run() -> None:
                     )
                     _last_logged_state = new_state
 
-                # ── Check if background recorder start finished ───────────
+                # ── Start recorder (synchronous — owns lifecycle) ─────────
                 if (
-                    _recorder_start_thread is not None
-                    and not _recorder_start_thread.is_alive()
-                    and _recorder_start_result[0] is not None
+                    _should_start_recording(sm)
+                    and not recorder.is_recording
+                    and "Recorder failed to start" not in (sm.session.error_details or "")
                 ):
-                    _started = _recorder_start_result[0]
-                    _recorder_start_result[0] = None  # consumed
+                    log.info("RECORDER → starting (state=%s)", sm.state.value)
+                    _rec_t0 = time.monotonic()
+                    _started = recorder.start_recording()
+                    _rec_elapsed = time.monotonic() - _rec_t0
+                    if _rec_elapsed > 2.0:
+                        log.warning("[REC-011] Recording start took too long | total=%.1fs", _rec_elapsed)
                     if _started:
                         log.info("RECORDER → started successfully")
                     else:
                         sm.session.error_details = (
-                            f"{(sm.session.error_details + ' | ') if sm.session.error_details else ''}"
-                            "Recorder failed to start"
-                        )
+                            ((sm.session.error_details or "") + " | Recorder failed to start")
+                        ).strip(" |")
                         log.error("RECORDER → failed to start; call will be saved without recording")
 
-                # ── Start recorder as early as possible (background) ──────
-                if (
-                    _should_start_recording(sm)
-                    and not recorder.is_recording
-                    and (_recorder_start_thread is None or not _recorder_start_thread.is_alive())
-                    and "Recorder failed to start" not in (sm.session.error_details or "")
-                ):
-                    _recorder_start_result[0] = None
-                    _recorder_start_thread = threading.Thread(
-                        target=_bg_start_recorder,
-                        args=(recorder, _recorder_start_result),
-                        daemon=True,
-                        name="recorder-start",
+                # ── [REC-012] Orphan recorder guard ───────────────────────
+                # recorder.is_recording should be False in any non-live state.
+                # If it is not, stop it immediately before it contaminates the
+                # next session.
+                if recorder.is_recording and not _should_start_recording(sm):
+                    log.warning(
+                        "[REC-012] Recorder active without live session — stopping orphan recording"
+                        " | state=%s",
+                        sm.state.value,
                     )
-                    log.info("RECORDER → starting (state=%s)", sm.state.value)
-                    _recorder_start_thread.start()
+                    _orph_ok = recorder.stop_recording()
+                    if not _orph_ok:
+                        recorder.force_stop_recording()
+                    _orph_ctxs = recorder.detach_contexts()
+                    _orph_snap = copy.deepcopy(sm.session)
+                    _orph_snap.ended_at = _orph_snap.ended_at or datetime.now()
+                    _orph_snap.status = CallState.ENDED.value
+                    _orph_err_parts = [p.strip() for p in (_orph_snap.error_details or "").split("|") if p.strip()]
+                    _orph_err_parts.append(
+                        "Recorder was active without a live call session; stopped by orphan guard"
+                    )
+                    _orph_snap.error_details = " | ".join(_orph_err_parts)
+                    if _orph_ctxs:
+                        _orph_t = threading.Thread(
+                            target=_finalize_call,
+                            args=(_orph_snap, recorder, _orph_ctxs, storage, reporter, uploader),
+                            daemon=True,
+                            name=f"finalize-orphan-{next(_FINALIZE_COUNTER)}-{datetime.now().strftime('%H%M%S')}",
+                        )
+                    else:
+                        _orph_t = threading.Thread(
+                            target=_finalize_no_recording,
+                            args=(_orph_snap, storage, reporter),
+                            daemon=True,
+                            name=f"finalize-orphan-norec-{next(_FINALIZE_COUNTER)}-{datetime.now().strftime('%H%M%S')}",
+                        )
+                    finalize_threads.add(_orph_t)
+                    _orph_t.start()
+                    if sm.state not in _TERMINAL_STATES:
+                        sm.transition(CallEvent.RESET)
+                        current_session_hwnd = None
+                        _last_logged_state = None
 
                 # ── Finalize on terminal state ────────────────────────────
                 if sm.is_terminal_state():
-                    # If recorder start is still pending in background, wait
-                    # briefly so we know whether recording actually started.
-                    if _recorder_start_thread is not None and _recorder_start_thread.is_alive():
-                        log.warning("RECORDER → waiting for background start before terminal finalize (max 5s)")
-                        _recorder_start_thread.join(timeout=5.0)
                     log.info(
                         "CALL END → %s | dir=%s | dur=%ss",
                         sm.state.value,
@@ -1305,8 +1302,6 @@ def run() -> None:
                     sm.transition(CallEvent.RESET)
                     detector.reset()
                     current_session_hwnd = None
-                    _recorder_start_thread = None
-                    _recorder_start_result[0] = None
                     _last_logged_state = None
 
                     # Each finalize gets its own deepcopy + contexts — safe to run concurrently

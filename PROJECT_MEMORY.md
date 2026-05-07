@@ -57,11 +57,20 @@ When the detector sees a window whose UIA status is in `ENDED_LABELS`:
 3. Ring emission block: if `not ring_event_emitted` and status in `ENDED_LABELS` → return
    `DetectionResult(None, ...)` before emitting any ring.
 
-### Non-blocking recorder start (fixed 2026-05-07 follow-up)
-`recorder.start_recording()` runs in a daemon thread via `_bg_start_recorder()`.
-Main loop checks `_recorder_start_thread.is_alive()` and `_recorder_start_result[0]`
-each iteration.  Join timeouts: 5 s before terminal finalize, 3 s before split.
-`[REC-011]` logged if startup > 2 s.
+### Recorder lifecycle ownership (final fix 2026-05-07)
+`recorder.start_recording()` is called **synchronously** in the poll loop — never
+in a background thread.  Async start was reverted because it allowed an orphan
+recorder to start after the session had already been reset.
+
+`_do_mute_check()` (UIA traversal, 20-30 s) runs in a daemon thread started
+inside `start_recording()` after engine.start() returns — this is the only
+async part and it is purely informational (mute logging).
+
+`[REC-011]` logged if engine or context phase of `start_recording()` > 2 s.
+`[REC-012]` orphan guard fires if `recorder.is_recording` when `_should_start_recording(sm)`
+is False — stops orphan recorder immediately and finalizes.
+
+**NEVER reintroduce async recorder start without a session token/cancel mechanism.**
 
 ## USB selection behavior
 
@@ -101,7 +110,8 @@ each iteration.  Join timeouts: 5 s before terminal finalize, 3 s before split.
 | `[REC-008]` | WAV file open failed |
 | `[REC-009]` | Silence detected for >6s during recording |
 | `[REC-010]` | Written frames < 70% of expected (timing/buffer issue) |
-| `[REC-011]` | `recorder.start_recording()` in background thread took > 2 s (WASAPI lock) |
+| `[REC-011]` | `recorder.start_recording()` engine or context phase > 2 s (WASAPI lock) |
+| `[REC-012]` | Orphan recorder guard — recorder running without live session; stopped immediately |
 | `[DEV-003]` | Zero input devices enumerated |
 | `[DEV-USB]` | USB headset connect/disconnect/selection event |
 | `[UPL-001]` | Unhandled exception in `process_pending_uploads` |

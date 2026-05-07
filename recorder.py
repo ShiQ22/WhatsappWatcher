@@ -1349,6 +1349,7 @@ class Recorder:
             if self._is_recording:
                 return False
 
+        _t0 = time.monotonic()
         output_dir = RECORDER_OUTPUT_DIR
 
         # Pre-recording disk space check (REC-008)
@@ -1382,14 +1383,24 @@ class Recorder:
         else:
             log.info("REC → using input device: %s", dev_name_for_log)
 
+        _t_engine = time.monotonic()
         if not self._engine.start(output_path, device):
             return False
+        _t_engine_elapsed = time.monotonic() - _t_engine
 
-        # Log initial mute state at call start (informational only — never blocks recording)
         dev_idx = device.get("index")
         dev_name = device.get("name", "?")
-        self._do_mute_check(dev_idx, dev_name)
 
+        # Mute check runs in a daemon thread — UIA traversal can take 20-30s
+        # on some systems; must never block start_recording() return.
+        threading.Thread(
+            target=self._do_mute_check,
+            args=(dev_idx, dev_name),
+            daemon=True,
+            name="mute-check",
+        ).start()
+
+        _t_ctx = time.monotonic()
         now = datetime.now()
         with self._lock:
             self._is_recording = True
@@ -1408,7 +1419,19 @@ class Recorder:
                 segment_index=self._segment_counter,
                 output_path=output_path,
             )
+        _t_ctx_elapsed = time.monotonic() - _t_ctx
+        _t_total = time.monotonic() - _t0
 
+        log.info(
+            "REC → start timing | total=%.2fs | engine=%.2fs | context=%.2fs",
+            _t_total, _t_engine_elapsed, _t_ctx_elapsed,
+        )
+        for _phase, _phase_elapsed in (("engine", _t_engine_elapsed), ("context", _t_ctx_elapsed)):
+            if _phase_elapsed > 2.0:
+                log.warning(
+                    "[REC-011] Recording start phase slow | phase=%s | elapsed=%.2fs",
+                    _phase, _phase_elapsed,
+                )
         log.info("REC → recording started | segment=%s | path=%s | device=%s",
                  self._segment_counter, output_path, device.get("name", "?"))
         return True

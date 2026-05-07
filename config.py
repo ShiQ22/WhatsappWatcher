@@ -45,7 +45,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "upload_retry_delay_seconds": 3.0,
         "startup_pending_upload_scan": True,
         "log_max_bytes": 5 * 1024 * 1024,
-        "log_backup_count": 3,
+        "log_backup_count": 5,
+        "log_level": "INFO",
     },
     "media": {
         "allowed_extensions": [".wav", ".mp3"],
@@ -208,7 +209,10 @@ UPLOAD_RETRY_COUNT = int(WATCHER.get("upload_retry_count", 3))
 UPLOAD_RETRY_DELAY_SECONDS = float(WATCHER.get("upload_retry_delay_seconds", 3.0))
 STARTUP_PENDING_UPLOAD_SCAN = bool(WATCHER.get("startup_pending_upload_scan", True))
 LOG_MAX_BYTES = int(WATCHER.get("log_max_bytes", 5 * 1024 * 1024))
-LOG_BACKUP_COUNT = int(WATCHER.get("log_backup_count", 3))
+LOG_BACKUP_COUNT = int(WATCHER.get("log_backup_count", 5))
+LOG_LEVEL: str = str(WATCHER.get("log_level", "INFO")).upper().strip()
+if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+    LOG_LEVEL = "INFO"
 
 ALLOWED_MEDIA_EXTENSIONS = {str(ext).lower() for ext in MEDIA.get("allowed_extensions", DEFAULT_CONFIG["media"]["allowed_extensions"])}
 
