@@ -642,6 +642,7 @@ class WhatsAppDetector:
         self._last_window_seen_ts = now_ts
         sig = f"{win.hwnd}:{win.width}x{win.height}:{win.pid}"
         new_window = self._call_hwnd is None or self._call_hwnd != win.hwnd
+        previous_hwnd = self._call_hwnd  # capture before any assignment so logs always show the real old value
 
         if new_window:
             if self._call_hwnd is None:
@@ -714,7 +715,7 @@ class WhatsAppDetector:
                 log.warning(
                     "DETECTOR → hwnd changed during answered session; new call proof found"
                     " | old_hwnd=%s | new_hwnd=%s | old_dir=%s | new_dir=%s",
-                    self._call_hwnd, win.hwnd, old_dir, new_dir_hint,
+                    previous_hwnd, win.hwnd, old_dir, new_dir_hint,
                 )
                 self._session_answered_proof_seen = False
                 self._session_answered_timer = None
@@ -864,12 +865,14 @@ class WhatsAppDetector:
                     f"answered | timer={self._session_answered_timer or '-'} | dir={self._call_direction or '?'}",
                     caller_number=self._caller_number,
                     direction=self._call_direction,
+                    hwnd=win.hwnd,
                 )
             return DetectionResult(
                 None, "detector",
                 f"answered active | timer={self._session_answered_timer or '-'}",
                 caller_number=self._caller_number,
                 direction=self._call_direction,
+                hwnd=win.hwnd,
             )
 
         # ── Log ongoing phase ────────────────────────────────────────────
@@ -891,6 +894,7 @@ class WhatsAppDetector:
             state.details if state else "scan unavailable; direction unknown; recording continues",
             caller_number=self._caller_number,
             direction=self._call_direction,
+            hwnd=win.hwnd,
         )
 
     # ── pywinauto fallback scan ──────────────────────────────────────────

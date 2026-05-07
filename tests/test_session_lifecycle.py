@@ -343,6 +343,186 @@ class TestDetectionResultHwndFields:
         assert result.is_strong_new_call is True
 
 
+# ── Detector: complete hwnd field coverage ────────────────────────────────────
+
+class TestDetectionResultHwndComplete:
+    """
+    Verify hwnd=win.hwnd is present on every DetectionResult emitted while a
+    call window exists: ring (already tested above), ANSWERED, active no-event,
+    ongoing phase, and the FIX-2 log uses the correct *previous* hwnd.
+    """
+
+    def _answered_detector(self, hwnd: int = 33333):
+        """Detector in fully-answered state on the given hwnd."""
+        from detector import WhatsAppDetector
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = hwnd
+        d._call_pid = 9999
+        d._ring_event_emitted = True
+        d._session_answered_proof_seen = True
+        d._session_answered_timer = "0:05"
+        d._answered_event_emitted = False  # will trigger ANSWERED on next poll
+        d._call_direction = "outgoing"
+        d._last_session_ended_ts = 0.0
+        d._last_strong_call_ui_ts = time.time()
+        return d
+
+    def test_answered_result_includes_hwnd(self):
+        """ANSWERED DetectionResult must carry hwnd=win.hwnd."""
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = self._answered_detector(hwnd=33333)
+        win = _WinInfo(hwnd=33333, pid=9999, width=400, height=300)
+        state = _make_uia_state(answered=True, timer_text="0:05")
+
+        result = _poll_with_mocks(d, win, state)
+
+        assert result.event == CallEvent.ANSWERED
+        assert result.hwnd == 33333
+
+    def test_active_noevent_result_includes_hwnd(self):
+        """Active no-event DetectionResult (answered_event_emitted=True) must carry hwnd."""
+        from detector import _WinInfo
+
+        d = self._answered_detector(hwnd=44444)
+        d._answered_event_emitted = True  # ANSWERED already sent; next poll = no-event
+        win = _WinInfo(hwnd=44444, pid=9999, width=400, height=300)
+        state = _make_uia_state(answered=True, timer_text="0:10")
+
+        result = _poll_with_mocks(d, win, state)
+
+        assert result.event is None
+        assert result.hwnd == 44444
+
+    def test_ongoing_phase_result_includes_hwnd(self):
+        """Ongoing-phase DetectionResult (ringing, ring not yet answered) must carry hwnd."""
+        from detector import WhatsAppDetector, _WinInfo
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = 55555
+        d._call_pid = 9999
+        d._ring_event_emitted = True          # ring already emitted
+        d._session_answered_proof_seen = False
+        d._call_direction = "incoming"
+        d._last_session_ended_ts = 0.0
+        d._last_strong_call_ui_ts = time.time()
+        win = _WinInfo(hwnd=55555, pid=9999, width=400, height=300)
+        state = _make_uia_state(ringing=True)
+
+        result = _poll_with_mocks(d, win, state)
+
+        assert result.event is None
+        assert result.hwnd == 55555
+
+    def test_previous_hwnd_used_in_fix2_log_not_new_hwnd(self, caplog):
+        """
+        FIX-2 warning log must show old_hwnd=11111 and new_hwnd=22222,
+        NOT old_hwnd=22222 (which was the bug before previous_hwnd was saved).
+        """
+        import logging
+        from detector import WhatsAppDetector, _WinInfo
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = 11111  # OLD answered hwnd
+        d._call_pid = 9999
+        d._ring_event_emitted = True
+        d._answered_event_emitted = True
+        d._session_answered_proof_seen = True
+        d._call_direction = "outgoing"
+        d._last_session_ended_ts = 0.0
+        d._last_strong_call_ui_ts = time.time()
+
+        new_win = _WinInfo(hwnd=22222, pid=9999, width=400, height=300)
+        new_state = _make_uia_state(incoming=True)  # ring proof → FIX-2 fires
+
+        with caplog.at_level(logging.WARNING, logger="detector"), \
+             patch.object(d, "get_whatsapp_pids", return_value={9999}), \
+             patch("detector._find_call_window", return_value=new_win), \
+             patch.object(d, "_scan_with_failover", return_value=(new_state, "comtypes")), \
+             patch.object(d, "_update_foreground_history"), \
+             patch.object(d, "_classify_direction_from_state", return_value=MagicMock()), \
+             patch.object(d, "_classify_direction_initial", return_value=MagicMock()):
+            d.poll()
+
+        fix2_lines = [r.message for r in caplog.records if "new call proof found" in r.message]
+        assert fix2_lines, "FIX-2 warning not emitted"
+        msg = fix2_lines[0]
+        # old_hwnd must be 11111 (the real old value), not 22222
+        assert "old_hwnd=11111" in msg, f"Expected old_hwnd=11111 in log, got: {msg}"
+        assert "new_hwnd=22222" in msg, f"Expected new_hwnd=22222 in log, got: {msg}"
+
+    def test_hwnd_change_no_ring_proof_preserves_answered_session(self):
+        """
+        When hwnd changes during answered session but new window shows answered=True
+        (no ring proof), the session must NOT be reset — preserving old answered truth.
+        """
+        from detector import WhatsAppDetector, _WinInfo
+        from state_machine import CallEvent
+
+        d = WhatsAppDetector()
+        d._wa_was_running = True
+        d._call_hwnd = 11111
+        d._call_pid = 9999
+        d._ring_event_emitted = True
+        d._answered_event_emitted = True
+        d._session_answered_proof_seen = True
+        d._call_direction = "outgoing"
+        d._last_session_ended_ts = 0.0
+        d._last_strong_call_ui_ts = time.time()
+
+        # New window shows answered=True but NOT incoming/outgoing/ringing — no ring proof
+        new_win = _WinInfo(hwnd=22222, pid=9999, width=400, height=300)
+        new_state = _make_uia_state(answered=True, timer_text="0:02")
+
+        result = _poll_with_mocks(d, new_win, new_state)
+
+        # Session preserved: no ring emitted, no reset
+        assert result.event != CallEvent.INCOMING_RING
+        assert result.event != CallEvent.OUTGOING_RING
+        assert result.event != CallEvent.CALL_STARTED
+        assert d._session_answered_proof_seen is True
+
+
+# ── Regression: single calls must not false-split ────────────────────────────
+
+class TestSingleCallRegressions:
+    """
+    Regression guard: a single outgoing or incoming call starting from IDLE
+    must never trigger a session split (is_live_session=False from IDLE).
+    """
+
+    def test_single_outgoing_call_no_false_split(self):
+        """IDLE + OUTGOING_RING: is_live_session=False → split_needed=False."""
+        from state_machine import StateMachine, CallEvent, CallState
+        from main import _TERMINAL_STATES
+
+        sm = StateMachine()
+        assert sm.state == CallState.IDLE
+
+        is_live = sm.state not in _TERMINAL_STATES
+        is_new_call_event = True
+        strong_new_call = True
+        different_hwnd = True  # worst case
+
+        split_needed = is_live and is_new_call_event and (different_hwnd or strong_new_call)
+        assert not split_needed  # IDLE is terminal → no split
+
+    def test_single_incoming_call_no_false_split(self):
+        """IDLE + INCOMING_RING: is_live_session=False → split_needed=False."""
+        from state_machine import StateMachine, CallState
+        from main import _TERMINAL_STATES
+
+        sm = StateMachine()
+        assert sm.state == CallState.IDLE
+
+        is_live = sm.state not in _TERMINAL_STATES
+        assert not is_live  # confirms IDLE is not a live session
+
+
 # ── FIX 2: stale ringing/connecting timeout ───────────────────────────────────
 
 class TestStaleRingingTimeout:
