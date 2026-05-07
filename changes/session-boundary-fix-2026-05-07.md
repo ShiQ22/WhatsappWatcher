@@ -188,4 +188,4 @@ Live log evidence:
 
 ## Git commit hash (follow-up)
 
-TBD — commit pending push.
+`1419259` — pushed to `origin/main`
