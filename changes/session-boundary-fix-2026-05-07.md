@@ -235,4 +235,4 @@ full UIA tree traversal: 20–30 s on systems with many UI elements.
 
 ## Git commit hash (final lifecycle fix)
 
-TBD — commit pending push.
+`b725fbd` — pushed to `origin/main`
