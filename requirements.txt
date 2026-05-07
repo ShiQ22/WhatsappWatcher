@@ -1,0 +1,10 @@
+psutil
+comtypes
+pywinauto
+pyaudiowpatch
+lameenc
+SQLAlchemy
+PyMySQL
+pytest
+pytest-cov
+pyinstaller

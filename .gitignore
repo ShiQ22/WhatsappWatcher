@@ -1,0 +1,34 @@
+# secrets / local config
+config.json
+
+# databases
+*.db
+*.sqlite
+*.sqlite3
+
+# logs and recordings
+recordings/
+*.wav
+*.mp3
+*.corrupted
+
+# build output
+dist/
+build/
+*.spec.bak
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# virtual env
+.venv/
+venv/
+env/
+
+# IDE/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

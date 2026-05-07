@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import config; print\\('OK', config.RECORDER_OUTPUT_DIR, config.RECORDER_FORMAT, config.BANDICAM_OUTPUT_DIR\\)\")",
+      "Bash(python -m pip install pyaudiowpatch lameenc pytest pytest-cov)",
+      "Bash(python -m pytest tests/test_device_manager.py -v)",
+      "Bash(python -m pytest tests/test_device_manager.py -v --cov=recorder --cov-report=term-missing)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m pytest tests/ --cov=recorder --cov-report=term-missing)",
+      "Bash(python -c \"from recorder import Recorder, RecordingContext; print\\('imports OK'\\)\")",
+      "Bash(python -c \"from config import BANDICAM_HEALTH_CHECK_INTERVAL_SECONDS; print\\('aliases OK'\\)\")",
+      "Bash(python -c \"import config; print\\('BANDICAM_PATH:', config.BANDICAM_PATH\\); import os; print\\('exists:', os.path.exists\\(config.BANDICAM_PATH\\)\\)\")",
+      "Bash(findstr /C:\"passed\" /C:\"failed\" /C:\"error\" /C:\"ERROR\")",
+      "Bash(python -m pytest tests/ --cov=recorder --cov-report=term-missing -q)",
+      "Bash(python -m pytest tests/test_capture_engine.py -v)",
+      "Bash(python -c \"from recorder import Recorder; print\\('imports OK'\\)\")",
+      "PowerShell(Set-Location \"F:\\\\Ahmed\\\\my work\\\\Whatsapp Calls\\\\new version no bandicam\\\\whatsapp_watcher_final\"; $result = python -m pytest tests/ --tb=short 2>&1; $result | Select-Object -Last 20; Write-Host \"Exit: $LASTEXITCODE\")",
+      "Bash(python -m pytest tests/ --tb=short -q)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -m pytest tests/ -q)",
+      "PowerShell(cd \"F:\\\\Ahmed\\\\my work\\\\Whatsapp Calls\\\\new version no bandicam\\\\whatsapp_watcher_final\"; python -m py_compile launcher.py main.py recorder.py uploader.py config.py storage.py detector.py state_machine.py report.py 2>&1; Write-Host \"EXIT: $LASTEXITCODE\")",
+      "PowerShell(Set-Location \"F:\\\\Ahmed\\\\my work\\\\Whatsapp Calls\\\\new version no bandicam\\\\whatsapp_watcher_final\"; $result = python -m pytest tests/ -v 2>&1; $result | Select-Object -First 80; Write-Host \"EXIT: $LASTEXITCODE\")",
+      "Bash(python -m py_compile launcher.py main.py recorder.py uploader.py config.py storage.py detector.py state_machine.py report.py)",
+      "Bash(python -m py_compile recorder.py main.py)",
+      "Bash(python -m py_compile launcher.py)",
+      "Bash(python -m py_compile recorder.py)",
+      "Bash(python -m pytest tests/ -v --tb=no -q)",
+      "Bash(python -m py_compile detector.py state_machine.py main.py)",
+      "Bash(python -m pytest tests/test_session_lifecycle.py -v)",
+      "Bash(python -m py_compile main.py detector.py)",
+      "Bash(python -m py_compile main.py detector.py recorder.py)"
+    ]
+  }
+}
