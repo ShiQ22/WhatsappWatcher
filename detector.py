@@ -585,6 +585,7 @@ class WhatsAppDetector:
     # ── Main poll ────────────────────────────────────────────────────────
 
     def poll(self) -> DetectionResult:
+        _poll_t0 = time.monotonic()
         now_ts = time.time()
         wa_pids = self.get_whatsapp_pids()
         wa_running = bool(wa_pids)
@@ -623,21 +624,19 @@ class WhatsAppDetector:
                 direction = self._call_direction or "unknown"
                 number = self._caller_number
                 hwnd_at_end = self._call_hwnd
-                log.info(
-                    "DETECTOR → ringing session ended by window disappearance"
-                    " | gap=%.1fs | dir=%s | number=%s | hwnd=%s",
-                    gap, direction, number or "-", hwnd_at_end,
+                _ringing_result = DetectionResult(
+                    CallEvent.ENDED, "detector",
+                    f"ringing session ended by window disappearance | gap={gap:.1f}s | dir={direction}",
+                    caller_number=number, direction=direction, hwnd=hwnd_at_end,
                 )
                 self._last_session_ended_ts = now_ts
                 self._last_ended_hwnd = hwnd_at_end
                 self._last_ended_ts = now_ts
                 self._last_ended_direction = direction
                 self._reset_internal_state()
-                return DetectionResult(
-                    CallEvent.ENDED, "detector",
-                    f"ringing session ended by window disappearance | gap={gap:.1f}s | dir={direction}",
-                    caller_number=number, direction=direction, hwnd=hwnd_at_end,
-                )
+                log.debug("DETECTOR → ringing session ended by window disappearance"
+                          " | gap=%.1fs | dir=%s | hwnd=%s", gap, direction, hwnd_at_end)
+                return _ringing_result
 
             # Answered (active) session: allow a brief gap before declaring ended —
             # WhatsApp can briefly close and reopen the window during an active call.
@@ -654,19 +653,18 @@ class WhatsAppDetector:
             number = self._caller_number
             hwnd_at_end = self._call_hwnd
             details = f"session ended | dir={direction} | timer={self._session_answered_timer or '-'}"
-            log.info(
-                "DETECTOR → session ended (was active) | dir=%s | timer=%s | number=%s",
-                direction, self._session_answered_timer or "-", number or "-",
+            _active_result = DetectionResult(
+                CallEvent.ENDED, "detector", details,
+                caller_number=number, direction=direction, hwnd=hwnd_at_end,
             )
             self._last_session_ended_ts = now_ts
             self._last_ended_hwnd = hwnd_at_end
             self._last_ended_ts = now_ts
             self._last_ended_direction = direction
             self._reset_internal_state()
-            return DetectionResult(
-                CallEvent.ENDED, "detector", details,
-                caller_number=number, direction=direction, hwnd=hwnd_at_end,
-            )
+            log.debug("DETECTOR → active session ended by window timeout | dir=%s | hwnd=%s",
+                      direction, hwnd_at_end)
+            return _active_result
 
         # ── Window found ─────────────────────────────────────────────────
         self._last_window_seen_ts = now_ts
@@ -832,21 +830,22 @@ class WhatsAppDetector:
         ):
             direction = self._call_direction or previous_direction or "unknown"
             number = self._caller_number
-            log.info(
-                "DETECTOR → ended by UI status | status=%s | dir=%s | number=%s | hwnd=%s",
-                state.status_text, direction, number or "-", previous_hwnd or win.hwnd,
-            )
-            self._last_session_ended_ts = now_ts
-            self._last_ended_hwnd = previous_hwnd or win.hwnd
-            self._last_ended_ts = now_ts
-            self._last_ended_direction = direction
-            self._reset_internal_state()
-            return DetectionResult(
+            _ended_hwnd = previous_hwnd or win.hwnd
+            result = DetectionResult(
                 CallEvent.ENDED, scan_source,
                 f"call ended by status text | dir={direction}",
                 caller_number=number, direction=direction,
-                hwnd=previous_hwnd or win.hwnd,
+                hwnd=_ended_hwnd,
             )
+            self._last_session_ended_ts = now_ts
+            self._last_ended_hwnd = _ended_hwnd
+            self._last_ended_ts = now_ts
+            self._last_ended_direction = direction
+            self._reset_internal_state()
+            # main.py already logs "DETECTOR → event=ENDED | source=... | details=..."
+            log.debug("DETECTOR → ended by UI status | status=%s | dir=%s | hwnd=%s",
+                      state.status_text, direction, _ended_hwnd)
+            return result
 
         # ── Stale ringing/connecting timeout ──────────────────────────────
         # When ring was emitted but no answered proof exists and the call UI
@@ -861,21 +860,20 @@ class WhatsAppDetector:
             direction = self._call_direction or "unknown"
             number = self._caller_number
             elapsed = now_ts - self._last_strong_call_ui_ts
-            log.info(
-                "DETECTOR → session ended by stale ringing UI | last_strong=%.1fs | dir=%s | number=%s",
-                elapsed, direction, number or "-",
+            _stale_result = DetectionResult(
+                CallEvent.ENDED, "detector",
+                f"session ended by stale ringing UI | dir={direction}",
+                caller_number=number, direction=direction,
+                hwnd=win.hwnd,
             )
             self._last_session_ended_ts = now_ts
             self._last_ended_hwnd = win.hwnd
             self._last_ended_ts = now_ts
             self._last_ended_direction = direction
             self._reset_internal_state()
-            return DetectionResult(
-                CallEvent.ENDED, "detector",
-                f"session ended by stale ringing UI | dir={direction}",
-                caller_number=number, direction=direction,
-                hwnd=win.hwnd,
-            )
+            log.debug("DETECTOR → stale ringing ended | last_strong=%.1fs | dir=%s",
+                      elapsed, direction)
+            return _stale_result
 
         # ── Emit ring event (first time window seen) ─────────────────────
         if not self._ring_event_emitted:
@@ -990,6 +988,12 @@ class WhatsAppDetector:
         else:
             log.debug("DETECTOR → scan unavailable; direction=unknown; session preserved; recording continues")
 
+        _poll_elapsed = time.monotonic() - _poll_t0
+        if _poll_elapsed > 2.0:
+            log.warning(
+                "[DET-001] detector.poll slow | elapsed=%.1fs | hwnd=%s",
+                _poll_elapsed, win.hwnd if win else None,
+            )
         return DetectionResult(
             None, "detector",
             state.details if state else "scan unavailable; direction unknown; recording continues",

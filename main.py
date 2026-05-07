@@ -1140,10 +1140,13 @@ def run() -> None:
                 if result.caller_number:
                     sm.session.caller_number = result.caller_number
 
-                # ── Recorder health check (every cycle when in call) ──────
-                # ensure_recording_alive is non-blocking unless the record
-                # thread is dead (then it restarts — small delay is fine).
-                if _should_start_recording(sm) and recorder.is_recording:
+                # ── Recorder health check (idle cycles only) ─────────────
+                # Skip when an actual event is present — the event must be
+                # processed immediately; health checks are deferred until the
+                # next idle poll.  (ensure_recording_alive's mute probe was a
+                # 20-30 s UIA traversal before being made async; this guard is
+                # additional defence so no health work blocks event handling.)
+                if result.event is None and _should_start_recording(sm) and recorder.is_recording:
                     recorder.ensure_recording_alive()
 
                 if (
@@ -1256,7 +1259,12 @@ def run() -> None:
                 # recorder.is_recording should be False in any non-live state.
                 # If it is not, stop it immediately before it contaminates the
                 # next session.
-                if recorder.is_recording and not _should_start_recording(sm):
+                # MUST NOT fire when sm.is_terminal_state() — the terminal
+                # finalization block below owns stop/detach/finalize for normal
+                # ended calls.  Firing here would steal the recording and leave
+                # the terminal block with no recorder, producing a duplicate
+                # no-recording finalize entry.
+                if recorder.is_recording and not _should_start_recording(sm) and not sm.is_terminal_state():
                     log.warning(
                         "[REC-012] Recorder active without live session — stopping orphan recording"
                         " | state=%s",

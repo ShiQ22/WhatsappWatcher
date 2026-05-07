@@ -21,6 +21,24 @@ microphone).
   segment index allocated on each recovery. Gives up after
   `RECORDER_WATCHDOG_RECOVERY_ATTEMPTS`.
 
+## Immediate ENDED return + terminal finalize ownership fix (2026-05-07)
+
+**Root cause 1 — 33-second delay:** `ensure_recording_alive()` called `_do_mute_check()` synchronously.
+`_do_mute_check` does a full UIA traversal (20-30 s). Fixed: spawn in daemon thread (`mute-check-health`).
+
+**Root cause 2 — REC-012 double finalize:** REC-012 guard ran for ENDED state (non-live,
+`_should_start_recording=False`), stopping recorder before terminal block ran. Fixed: added
+`and not sm.is_terminal_state()` to REC-012 condition.
+
+**Defense:** `ensure_recording_alive()` only called when `result.event is None` — any real event
+bypasses health checks and is processed immediately.
+
+**Detector ENDED paths:** All four terminal paths (UI-status, ringing-window-gone,
+active-window-gone, stale-ringing) now build result first, then reset state, then return.
+No INFO log before return.
+
+**Rule:** `_do_mute_check` MUST NEVER be called synchronously on the main poll thread.
+
 ## Fast back-to-back call boundary fix (2026-05-07)
 
 **Root cause:** `SESSION_WINDOW_GAP_SECONDS = 2.5` preserved ALL sessions for 2.5 s after the

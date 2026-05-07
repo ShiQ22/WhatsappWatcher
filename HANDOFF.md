@@ -86,6 +86,31 @@ is_live_session and is_new_call_event
   `not answered`), the ring state is reset and a new ring event is emitted.
   If no ring proof is seen, the answered session is preserved (same call, different window).
 
+## Immediate ENDED return and terminal finalize ownership (2026-05-07)
+
+### Root causes (live log evidence)
+1. `detector.poll()` returned ENDED at 14:50:34; `main.py` processed it at 14:51:07 — 33 s gap.
+   Cause: `recorder.ensure_recording_alive()` called `_do_mute_check()` **synchronously**.
+   `_do_mute_check` → `_check_whatsapp_mute` → full UIA traversal — same 20-30 s blocker
+   fixed for `start_recording()`, but was still synchronous in the health-check path.
+2. `[REC-012]` fired for normal ENDED calls, stopping the recorder and starting a finalize
+   before the terminal block ran.  Terminal block then created a second no-recording finalize.
+
+### Fixes
+- `recorder.py` `ensure_recording_alive()`: `_do_mute_check` is now spawned as a daemon thread
+  (`mute-check-health`) — never blocks the caller.
+- `main.py` health check: `ensure_recording_alive()` is only called when `result.event is None`.
+  Any real event bypasses the health check entirely and is handled immediately.
+- `main.py` REC-012: added `and not sm.is_terminal_state()` — REC-012 never fires when the
+  terminal finalization block is about to run.
+- `detector.py` ENDED paths: all four paths build `DetectionResult` first, then update state,
+  then return — no INFO log before the return that could introduce ordering surprises.
+- `detector.py` [DET-001]: `poll()` logs a WARNING if it takes > 2 s (non-critical path only).
+
+### Critical rule added
+`_do_mute_check` must NEVER be called synchronously from any path that runs on the main poll
+thread.  It does a full UIA tree traversal.  Always spawn it as a daemon thread.
+
 ## Fast back-to-back call boundary (2026-05-07)
 
 ### Root cause

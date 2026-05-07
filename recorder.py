@@ -1572,12 +1572,19 @@ class Recorder:
             dev_idx = self._device_index
             dev_name = self._device_name_for_mute
 
-        # Periodic mute-state probe — max once every 10 seconds, never blocks recording
+        # Periodic mute-state probe — max once every 10 seconds, never blocks recording.
+        # Must run in a daemon thread: _check_whatsapp_mute does a full UIA traversal
+        # (20-30 s) — calling it synchronously here would block the main poll loop.
         now = time.time()
         if now - last_check >= 10.0:
             with self._lock:
                 self._last_mute_check = now
-            self._do_mute_check(dev_idx, dev_name)
+            threading.Thread(
+                target=self._do_mute_check,
+                args=(dev_idx, dev_name),
+                daemon=True,
+                name="mute-check-health",
+            ).start()
 
         if self._engine.is_active:
             return True

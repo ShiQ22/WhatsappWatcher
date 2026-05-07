@@ -318,4 +318,38 @@ terminal, crash, and orphan-guard paths.
 
 ## Git commit hash (fast back-to-back fix)
 
+`91a8c0c` — pushed to `origin/main`
+
+---
+
+# Immediate ENDED return and terminal finalize ownership — 2026-05-07
+
+## Root causes (live log evidence)
+
+**33-second ENDED delay:**
+- `detector.poll()` returned `ENDED` at 14:50:34 (logged "ended by UI status").
+- `main.py` did not log/process it until 14:51:07.
+- Cause: `recorder.ensure_recording_alive()` called `_do_mute_check()` **synchronously**,
+  which does `Desktop(backend="uia").windows(...)` + `win.descendants(...)` — the same
+  20-30 s UIA blocker already fixed for `start_recording()`, but was left in the
+  health-check path.
+
+**REC-012 stealing terminal finalization:**
+- After `sm.transition(ENDED)`, `_should_start_recording()=False`, `recorder.is_recording=True`.
+- REC-012 condition matched → stopped recorder → started `_finalize_call`.
+- Terminal block then ran: `was_recording=False` → created a second `_finalize_no_recording`.
+- Result: two finalize threads; recording in one, "no recording" marker in the other.
+
+## Fixes
+
+| Fix | File | Change |
+|---|---|---|
+| Async mute check in health path | `recorder.py` | `ensure_recording_alive()`: `_do_mute_check` spawned as daemon thread `mute-check-health` |
+| Skip health check on events | `main.py` | Added `result.event is None` guard — any real event bypasses health check entirely |
+| REC-012 skips terminal states | `main.py` | Added `and not sm.is_terminal_state()` |
+| Detector ENDED paths — result-first | `detector.py` | All 4 ENDED paths build result, update state, reset, DEBUG-log, return — no INFO before return |
+| [DET-001] timing guard | `detector.py` | Warns if `poll()` takes > 2 s (non-critical ongoing path only) |
+
+## Git commit hash (immediate ENDED fix)
+
 TBD — commit pending

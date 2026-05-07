@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-05-07 final² — Immediate ENDED return, async mute health-check, terminal finalize ownership
+
+### Root causes (from live log)
+
+**33-second ENDED delay:**
+`detector.poll()` returned ENDED at 14:50:34 (logged "ended by UI status").
+`main.py` did not process it until 14:51:07 — 33 seconds later.
+Cause: `recorder.ensure_recording_alive()` called `_do_mute_check()` **synchronously**.
+`_do_mute_check()` → `_check_whatsapp_mute()` → full UIA tree traversal (20–30 s).
+This was the same blocker fixed in `start_recording()`, but the identical call was left in
+the health-check path.
+
+**REC-012 stealing terminal finalization:**
+After `sm.transition(ENDED)`, `_should_start_recording()=False` and `recorder.is_recording=True`.
+REC-012 fired first, stopped the recorder, and started `_finalize_call`.
+The normal terminal block then saw `was_recording=False` and created a second `_finalize_no_recording`.
+Result: two finalize entries, one with the recording and one marked "no recording."
+
+### Fixes
+
+| Fix | File | Change |
+|---|---|---|
+| Async mute check in health path | `recorder.py` | `ensure_recording_alive()` now spawns `_do_mute_check` in a daemon thread (`mute-check-health`) — same pattern as `start_recording()` |
+| Skip health check on events | `main.py` | `ensure_recording_alive()` only called when `result.event is None`; any real event is processed without delay |
+| REC-012 skips terminal states | `main.py` | Added `and not sm.is_terminal_state()` to REC-012 condition; normal ended calls are handled exclusively by the terminal finalization block |
+| Detector ENDED paths — no INFO before return | `detector.py` | All four ENDED paths (UI-status, ringing-window-gone, active-window-gone, stale-ringing) now build `DetectionResult` first, update state, call `_reset_internal_state()`, log DEBUG, then return; `main.py` INFO log is the authoritative record |
+| [DET-001] poll timing guard | `detector.py` | Logs warning if `detector.poll()` takes > 2 s (checked on the non-critical ongoing-phase return only) |
+
+### Expected log order after fix
+
+```
+DETECTOR → event=CallEvent.ENDED   ← same second as detector detection (no 33 s gap)
+STATE    → ended
+CALL END → ended
+RECORDER → stopping for terminal state ended
+FINALIZE → starting | dir=outgoing
+STATE    → reset to idle (finalize running in background)
+```
+
+No `[REC-012]`. No duplicate `FINALIZE → no-recording`.
+
+---
+
 ## 2026-05-07 fast back-to-back — Immediate ENDED for ringing sessions, session_generation split
 
 ### Problem fixed
