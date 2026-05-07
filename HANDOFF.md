@@ -86,6 +86,33 @@ is_live_session and is_new_call_event
   `not answered`), the ring state is reset and a new ring event is emitted.
   If no ring proof is seen, the answered session is preserved (same call, different window).
 
+## Fast back-to-back call boundary (2026-05-07)
+
+### Root cause
+`SESSION_WINDOW_GAP_SECONDS = 2.5` was preserving ALL sessions for 2.5 s after the window
+disappeared.  For ringing calls (not yet answered), this caused fast back-to-back calls on
+the same hwnd to merge into one session.
+
+### Fix
+The window-missing block in `detector.py` now branches on `_session_answered_proof_seen`:
+
+- `False` (ringing/calling/connecting): emit `ENDED` immediately — no gap wait.
+- `True` (answered/active): keep the 2.5 s gap (WhatsApp can briefly reopen the window).
+
+`_session_generation` (int, never reset) increments on every ring emission.  `DetectionResult`
+carries it as `session_generation`.  `main.py` stores `current_session_generation` alongside
+`current_session_hwnd`.  `different_generation` (same hwnd, different generation) is an
+additional split trigger so that hwnd reuse is caught even if `different_hwnd=False`.
+
+`state.ringing` was added to `strong_new_session` so ringing-label-only windows bypass the
+post-terminal cooldown (previously only `incoming`, `outgoing`, `answered`, `connecting`).
+
+### Design rules added
+- Do NOT restore the 2.5 s window gap for ringing sessions — it causes fast back-to-back merges.
+- `_session_generation`, `_last_ended_hwnd`, `_last_ended_ts`, `_last_ended_direction` are
+  in `__init__` ONLY — never in `_reset_internal_state`.
+- `current_session_generation` must be reset to 0 in EVERY path that resets `current_session_hwnd`.
+
 ## What NOT to change casually
 
 | Area | Reason |

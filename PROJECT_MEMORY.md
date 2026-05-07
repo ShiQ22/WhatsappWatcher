@@ -21,6 +21,27 @@ microphone).
   segment index allocated on each recovery. Gives up after
   `RECORDER_WATCHDOG_RECOVERY_ATTEMPTS`.
 
+## Fast back-to-back call boundary fix (2026-05-07)
+
+**Root cause:** `SESSION_WINDOW_GAP_SECONDS = 2.5` preserved ALL sessions for 2.5 s after the
+window disappeared.  For unanswered (ringing) calls, a new call starting within 2.5 s on the
+same hwnd would find `_ring_event_emitted=True` and never fire a new ring event.
+
+**Fix (detector.py window-missing block):**
+- `_session_answered_proof_seen=False` (ringing): emit ENDED immediately on first missing-window poll.
+- `_session_answered_proof_seen=True` (active call): keep 2.5 s gap as before.
+
+**Defense-in-depth (detector.py + main.py):**
+- `_session_generation` (int, `__init__` only) increments on each ring emission.
+- `DetectionResult.session_generation` carries the generation value.
+- `current_session_generation` in main.py tracks the current session's generation.
+- `different_generation` split condition: same hwnd but different generation → split.
+- `state.ringing` added to `strong_new_session` for post-terminal cooldown bypass.
+- `DETECTOR → strong new call bypassed post-terminal cooldown` log added.
+- `_last_ended_hwnd / _last_ended_ts / _last_ended_direction` saved in all ENDED paths.
+
+**Critical rule:** Do NOT restore the 2.5 s window gap for ringing sessions.
+
 ## Session boundary bug history and final design
 
 ### Problem (fixed 2026-05-07)

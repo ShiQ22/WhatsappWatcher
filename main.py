@@ -960,6 +960,7 @@ def run() -> None:
     last_sync_ts = 0.0
     last_cleanup_ts = 0.0
     current_session_hwnd: Optional[int] = None
+    current_session_generation: int = 0
     sync_thread: Optional[threading.Thread] = None
     cleanup_thread: Optional[threading.Thread] = None
     finalize_threads: set[threading.Thread] = set()
@@ -1047,6 +1048,15 @@ def run() -> None:
                     and result_hwnd is not None
                     and result_hwnd != current_session_hwnd
                 )
+                # Same hwnd, but generation incremented → detector saw a new ring
+                # event on the same window handle (rapid reuse by WhatsApp).
+                different_generation = (
+                    current_session_hwnd is not None
+                    and result_hwnd is not None
+                    and result_hwnd == current_session_hwnd
+                    and current_session_generation != 0
+                    and getattr(result, "session_generation", 0) != current_session_generation
+                )
                 strong_new_call = bool(getattr(result, "is_strong_new_call", False))
                 new_dir = result.direction or (
                     "incoming" if result.event == CallEvent.INCOMING_RING
@@ -1067,6 +1077,7 @@ def run() -> None:
                     and not weak_call_started
                     and (
                         different_hwnd
+                        or different_generation
                         or strong_new_call
                         or sm.state in (
                             CallState.RINGING_UNKNOWN,
@@ -1083,9 +1094,12 @@ def run() -> None:
                     log.warning(
                         "SESSION SPLIT → new call boundary"
                         " | old_state=%s | old_dir=%s | new_dir=%s"
-                        " | old_hwnd=%s | new_hwnd=%s | strong_new=%s",
+                        " | old_hwnd=%s | new_hwnd=%s | strong_new=%s"
+                        " | old_gen=%s | new_gen=%s",
                         sm.state.value, old_dir, new_dir,
                         current_session_hwnd, result_hwnd, strong_new_call,
+                        current_session_generation,
+                        getattr(result, "session_generation", 0),
                     )
                     if split_snap.ended_at is None:
                         split_snap.ended_at = datetime.now()
@@ -1099,6 +1113,7 @@ def run() -> None:
                             log.error("RECORDER → /stop failed during session split")
                     sm.transition(CallEvent.RESET)
                     current_session_hwnd = None
+                    current_session_generation = 0
                     # Do NOT call detector.reset() — detector already tracks the new window.
                     _last_logged_state = None
                     if split_was_recording and split_recorder_contexts:
@@ -1157,6 +1172,7 @@ def run() -> None:
                     sm.transition(CallEvent.RESET)
                     detector.reset()
                     current_session_hwnd = None
+                    current_session_generation = 0
                     _last_logged_state = None
                     can_finalize_recording = bool(recorder_contexts) and (stop_ok or forced_stop_ok)
                     if can_finalize_recording:
@@ -1195,9 +1211,10 @@ def run() -> None:
                 prev_state = sm.state.value
                 sm.transition(result.event)
 
-                # Track which hwnd owns the active session for split detection
+                # Track which hwnd and generation own the active session for split detection
                 if is_new_call_event and result_hwnd:
                     current_session_hwnd = result_hwnd
+                    current_session_generation = getattr(result, "session_generation", 0)
 
                 # Re-apply direction after transition (state machine may have reset)
                 if result.direction and result.direction != sm.session.direction:
@@ -1276,6 +1293,7 @@ def run() -> None:
                     if sm.state not in _TERMINAL_STATES:
                         sm.transition(CallEvent.RESET)
                         current_session_hwnd = None
+                        current_session_generation = 0
                         _last_logged_state = None
 
                 # ── Finalize on terminal state ────────────────────────────
@@ -1302,6 +1320,7 @@ def run() -> None:
                     sm.transition(CallEvent.RESET)
                     detector.reset()
                     current_session_hwnd = None
+                    current_session_generation = 0
                     _last_logged_state = None
 
                     # Each finalize gets its own deepcopy + contexts — safe to run concurrently

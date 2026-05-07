@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-05-07 fast back-to-back — Immediate ENDED for ringing sessions, session_generation split
+
+### Problem fixed
+
+Fast back-to-back calls (1–3 seconds apart) were merging into one session and one recording.
+
+### Root cause
+
+`SESSION_WINDOW_GAP_SECONDS = 2.5` was applied to ALL sessions regardless of call phase.
+When a ringing/calling window disappeared and a new call appeared within 2.5 s on the same
+hwnd, the preservation kept the old session alive with `_ring_event_emitted=True`, so no
+new ring event fired and the two calls were treated as one.
+
+### Fixes
+
+| Fix | File | Change |
+|---|---|---|
+| Immediate ENDED for ringing sessions | `detector.py` | Window-missing block split by `_session_answered_proof_seen`; ringing sessions emit ENDED immediately (no gap); active sessions keep 2.5 s gap |
+| Session generation tracking | `detector.py` | `_session_generation` increments on each ring emission; included in `DetectionResult.session_generation` |
+| Same-hwnd reuse split | `main.py` | `different_generation` condition: same hwnd + different generation → split triggered |
+| `state.ringing` in cooldown bypass | `detector.py` | Added to `strong_new_session` so ringing-label-only windows bypass post-terminal cooldown |
+| Post-terminal cooldown bypass log | `detector.py` | `DETECTOR → strong new call bypassed post-terminal cooldown` logged when bypass fires |
+| Same-hwnd reuse log | `detector.py` | `DETECTOR → same hwnd reused for new call` logged when WhatsApp recycles a window handle quickly |
+| Last-ended metadata | `detector.py` | `_last_ended_hwnd`, `_last_ended_ts`, `_last_ended_direction` saved in all ENDED paths for diagnosis |
+| Generation reset in all reset paths | `main.py` | `current_session_generation = 0` on split, terminal, crash, and orphan guard paths |
+
+### Behavior now guaranteed
+
+- A ringing/calling session whose window disappears emits ENDED on the very next poll — no 2.5 s delay.
+- A new call starting within 1–3 s of the previous ringing session gets a clean session boundary.
+- Active (answered) sessions still tolerate a 2.5 s window gap (WhatsApp can briefly reopen the window during a live call).
+- WhatsApp hwnd reuse (same handle for a new call) is detected via `session_generation` and triggers a split in main.py.
+- `state.ringing` now bypasses post-terminal cooldown, matching `state.incoming` and `state.outgoing`.
+
+### Manual verification checklist
+
+1. Outgoing call → hang up immediately → new outgoing call within 2 s → two separate records, two files, no merged recording.
+2. Outgoing call → hang up → incoming call within 2 s → two records.
+3. Single outgoing call (answer + hang up) → one record, one file, no `[REC-012]`.
+4. Log must show `DETECTOR → ringing session ended by window disappearance` (not `session ended (no timer proof)`).
+5. Log must show `SESSION SPLIT → new call boundary | old_gen=X | new_gen=Y` when a back-to-back call happens via split path.
+
+---
+
 ## 2026-05-07 final — Synchronous fast recorder start, orphan guard, log cap
 
 ### Problem fixed

@@ -236,3 +236,86 @@ full UIA tree traversal: 20–30 s on systems with many UI elements.
 ## Git commit hash (final lifecycle fix)
 
 `b725fbd` — pushed to `origin/main`
+
+---
+
+# Fast back-to-back call boundary fix — 2026-05-07
+
+## Root cause
+
+`SESSION_WINDOW_GAP_SECONDS = 2.5` was applied to ALL sessions when the call window
+disappeared.  For a ringing (unanswered) call:
+
+1. Call A ringing (hwnd=X) → ring emitted, `_ring_event_emitted=True`.
+2. Window disappears (call rejected/cancelled/missed).
+3. Polls during 2.5 s gap: window gone → "preserving session" → no ENDED emitted.
+4. Call B starts within 2.5 s on the same hwnd=X:
+   - `new_window=False` (same hwnd) → `_ring_event_emitted=True` still → no ring emitted.
+   - Calls A and B merged into one session/recording.
+
+## Fixes
+
+### detector.py — window-missing block
+
+Split by `_session_answered_proof_seen`:
+
+```python
+if not self._session_answered_proof_seen:
+    # Ringing session: emit ENDED immediately
+    log.info("DETECTOR → ringing session ended by window disappearance | gap=%.1fs | ...")
+    # save _last_ended_* ; reset ; return ENDED
+else:
+    # Active (answered) session: keep 2.5 s gap
+    if gap <= SESSION_WINDOW_GAP_SECONDS:
+        return DetectionResult(None, ...)  # preserve
+    # gap > 2.5 s: ENDED
+```
+
+### detector.py — `_session_generation`
+
+- Added to `__init__` (never reset by `_reset_internal_state`).
+- Increments each time a ring event is emitted.
+- Included in every ring `DetectionResult` as `session_generation`.
+
+### main.py — `current_session_generation` + `different_generation`
+
+```python
+different_generation = (
+    current_session_hwnd is not None
+    and result_hwnd is not None
+    and result_hwnd == current_session_hwnd
+    and current_session_generation != 0
+    and result.session_generation != current_session_generation
+)
+split_needed = (is_live_session and is_new_call_event and not weak_call_started
+    and (different_hwnd or different_generation or strong_new_call or sm.state in RINGING...))
+```
+
+`current_session_generation` is reset to 0 alongside `current_session_hwnd` in split,
+terminal, crash, and orphan-guard paths.
+
+### detector.py — post-terminal cooldown improvements
+
+- `state.ringing` added to `strong_new_session` (was missing; blocked ringing-label-only windows from bypassing cooldown).
+- `DETECTOR → strong new call bypassed post-terminal cooldown` logged when bypass fires.
+- `DETECTOR → same hwnd reused for new call` logged when WhatsApp recycles a window handle within 5 s.
+
+### All ENDED paths — save `_last_ended_*`
+
+`_last_ended_hwnd`, `_last_ended_ts`, `_last_ended_direction` saved before every
+`_reset_internal_state()` call (window-missing, ended-by-UI-status, stale-ringing).
+
+## Files changed
+
+| File | Change |
+|---|---|
+| `detector.py` | Window-missing block split; `_session_generation`; `_last_ended_*`; `state.ringing` in cooldown; bypass log; same-hwnd log |
+| `main.py` | `current_session_generation`; `different_generation` split condition; generation reset in all paths |
+| `CHANGELOG.md` | New section |
+| `HANDOFF.md` | New section |
+| `PROJECT_MEMORY.md` | New section |
+| `changes/session-boundary-fix-2026-05-07.md` | This entry |
+
+## Git commit hash (fast back-to-back fix)
+
+TBD — commit pending

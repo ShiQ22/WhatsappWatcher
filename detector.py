@@ -178,6 +178,7 @@ class DetectionResult:
     hwnd: Optional[int] = None
     is_new_window: bool = False
     is_strong_new_call: bool = False
+    session_generation: int = 0
 
 
 @dataclass
@@ -404,6 +405,13 @@ class WhatsAppDetector:
         self._last_whatsapp_foreground_ts = 0.0
         self._wa_was_running: Optional[bool] = None
         self._last_session_ended_ts: float = 0.0
+        # Session generation: increments each time a ring is emitted; never reset by
+        # _reset_internal_state so main.py can detect same-hwnd new-call reuse.
+        self._session_generation: int = 0
+        # Last-ended metadata: survives reset so same-hwnd reuse can be detected.
+        self._last_ended_hwnd: Optional[int] = None
+        self._last_ended_ts: float = 0.0
+        self._last_ended_direction: Optional[str] = None
         self._reset_internal_state()
 
     def _reset_internal_state(self) -> None:
@@ -607,6 +615,32 @@ class WhatsAppDetector:
                 return DetectionResult(None, "detector", "No call window")
 
             gap = now_ts - (self._last_window_seen_ts or now_ts)
+
+            if not self._session_answered_proof_seen:
+                # Ringing/calling/connecting session: emit ENDED immediately so a fast
+                # back-to-back call (1-3 s) gets a clean session boundary.  No gap
+                # preservation — there is nothing worth preserving for an unanswered call.
+                direction = self._call_direction or "unknown"
+                number = self._caller_number
+                hwnd_at_end = self._call_hwnd
+                log.info(
+                    "DETECTOR → ringing session ended by window disappearance"
+                    " | gap=%.1fs | dir=%s | number=%s | hwnd=%s",
+                    gap, direction, number or "-", hwnd_at_end,
+                )
+                self._last_session_ended_ts = now_ts
+                self._last_ended_hwnd = hwnd_at_end
+                self._last_ended_ts = now_ts
+                self._last_ended_direction = direction
+                self._reset_internal_state()
+                return DetectionResult(
+                    CallEvent.ENDED, "detector",
+                    f"ringing session ended by window disappearance | gap={gap:.1f}s | dir={direction}",
+                    caller_number=number, direction=direction, hwnd=hwnd_at_end,
+                )
+
+            # Answered (active) session: allow a brief gap before declaring ended —
+            # WhatsApp can briefly close and reopen the window during an active call.
             if gap <= SESSION_WINDOW_GAP_SECONDS:
                 return DetectionResult(
                     None, "detector",
@@ -615,23 +649,19 @@ class WhatsAppDetector:
                     direction=self._call_direction,
                 )
 
-            # Window gone long enough — finalize session (always ENDED, always kept)
+            # Active session window gone long enough — finalize
             direction = self._call_direction or "unknown"
             number = self._caller_number
             hwnd_at_end = self._call_hwnd
-            if self._session_answered_proof_seen:
-                details = f"session ended | dir={direction} | timer={self._session_answered_timer or '-'}"
-                log.info(
-                    "DETECTOR → session ended (was active) | dir=%s | timer=%s | number=%s",
-                    direction, self._session_answered_timer or "-", number or "-",
-                )
-            else:
-                details = f"session ended before timer proof | dir={direction}"
-                log.info(
-                    "DETECTOR → session ended (no timer proof) | dir=%s | number=%s",
-                    direction, number or "-",
-                )
+            details = f"session ended | dir={direction} | timer={self._session_answered_timer or '-'}"
+            log.info(
+                "DETECTOR → session ended (was active) | dir=%s | timer=%s | number=%s",
+                direction, self._session_answered_timer or "-", number or "-",
+            )
             self._last_session_ended_ts = now_ts
+            self._last_ended_hwnd = hwnd_at_end
+            self._last_ended_ts = now_ts
+            self._last_ended_direction = direction
             self._reset_internal_state()
             return DetectionResult(
                 CallEvent.ENDED, "detector", details,
@@ -729,8 +759,29 @@ class WhatsAppDetector:
                 self._last_uia_phase = None
 
         elapsed_since_end = now_ts - self._last_session_ended_ts
+
+        # Log same-hwnd reuse: helpful for diagnosing rapid back-to-back calls
+        # on WhatsApp builds that recycle window handles between calls.
+        if (
+            new_window
+            and self._last_ended_hwnd is not None
+            and win.hwnd == self._last_ended_hwnd
+            and now_ts - self._last_ended_ts <= 5.0
+        ):
+            log.info(
+                "DETECTOR → same hwnd reused for new call"
+                " | hwnd=%s | age=%.1fs | last_dir=%s",
+                win.hwnd, now_ts - self._last_ended_ts,
+                self._last_ended_direction or "-",
+            )
+
+        # state.ringing added so that a ringing-label-only window (no incoming/outgoing
+        # UIA flag yet) also bypasses the post-terminal cooldown.
         strong_new_session = bool(
-            state and (state.incoming or state.outgoing or state.answered or state.connecting)
+            state and (
+                state.incoming or state.outgoing or state.answered
+                or state.connecting or state.ringing
+            )
         )
         session_started_this_poll = new_window and elapsed_since_end >= 0
         if session_started_this_poll and elapsed_since_end < POST_TERMINAL_HARD_SUPPRESS_SECONDS and not strong_new_session:
@@ -744,6 +795,12 @@ class WhatsAppDetector:
         ):
             remaining = POST_TERMINAL_COOLDOWN_SECONDS - elapsed_since_end
             return DetectionResult(None, "detector", f"post-terminal cooldown {remaining:.1f}s")
+        if session_started_this_poll and strong_new_session and elapsed_since_end < POST_TERMINAL_COOLDOWN_SECONDS:
+            log.info(
+                "DETECTOR → strong new call bypassed post-terminal cooldown"
+                " | elapsed=%.1fs | hwnd=%s",
+                elapsed_since_end, win.hwnd,
+            )
 
         # Update direction (best-effort; unknown is acceptable)
         self._maybe_apply_direction(self._classify_direction_from_state(win, state))
@@ -780,6 +837,9 @@ class WhatsAppDetector:
                 state.status_text, direction, number or "-", previous_hwnd or win.hwnd,
             )
             self._last_session_ended_ts = now_ts
+            self._last_ended_hwnd = previous_hwnd or win.hwnd
+            self._last_ended_ts = now_ts
+            self._last_ended_direction = direction
             self._reset_internal_state()
             return DetectionResult(
                 CallEvent.ENDED, scan_source,
@@ -806,6 +866,9 @@ class WhatsAppDetector:
                 elapsed, direction, number or "-",
             )
             self._last_session_ended_ts = now_ts
+            self._last_ended_hwnd = win.hwnd
+            self._last_ended_ts = now_ts
+            self._last_ended_direction = direction
             self._reset_internal_state()
             return DetectionResult(
                 CallEvent.ENDED, "detector",
@@ -852,11 +915,13 @@ class WhatsAppDetector:
             )
             _is_strong_new_call = ring_dir != "unknown" or _strong_proof
             self._ring_event_emitted = True
+            self._session_generation += 1
             if self._last_strong_call_ui_ts <= 0.0:
                 self._last_strong_call_ui_ts = now_ts
             log.info(
-                "DETECTOR → ring emitted | dir=%s | hwnd=%s | scan=%s | strong=%s",
+                "DETECTOR → ring emitted | dir=%s | hwnd=%s | scan=%s | strong=%s | gen=%s",
                 ring_dir, win.hwnd, scan_source if state else "none", _is_strong_new_call,
+                self._session_generation,
             )
             return DetectionResult(
                 event,
@@ -867,6 +932,7 @@ class WhatsAppDetector:
                 hwnd=win.hwnd,
                 is_new_window=new_window,
                 is_strong_new_call=_is_strong_new_call,
+                session_generation=self._session_generation,
             )
 
         # ── Lock answered state when timer proof seen ────────────────────
