@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-05-08 — Direction no-downgrade, USB silence loop, MP3/48 kHz
+
+### Root causes
+
+**Direction overwrite**: `"unknown"` is a truthy string; the propagation condition
+`if result.direction and result.direction != sm.session.direction` fired when
+`result.direction == "unknown"` and `sm.session.direction == "outgoing"`, overwriting
+the proven direction.
+
+**USB disconnect crash / short WAV**: `_record_loop` called `break` when both streams
+were `None`.  The record thread exited; the WAV was finalized at the disconnect timestamp,
+not the call end.  Worse: after device removal, the next `pyaudiowpatch.read()` on a dead
+WASAPI stream could trigger a Windows access violation (C-level crash).
+
+**Wrong sample rate**: USB device native rate is 48000 Hz; config said 44100.  Watcher
+auto-fallback was triggered every call, causing a startup warning.
+
+### Fixes
+
+| Fix | File | Change |
+|---|---|---|
+| No-downgrade direction guard | `main.py` | `_should_update_direction()`: returns `False` when `new_dir == "unknown"` and `current_dir` is proven |
+| Session direction latch | `main.py` | `_save/load/clear_session_latch()` to `data/active_call_session.json`; restored on crash-restart when hwnd or session_generation matches |
+| `on_usb_disconnect()` | `recorder.py` | Nulls stream refs under lock; `stop_stream()` only (no `close()`) on USB removal path |
+| Silence loop | `recorder.py` | `_record_loop` both-streams-gone: writes silence, calls `_try_reconnect_streams_async()`, sleeps, continues instead of breaking |
+| Non-blocking reconnect | `recorder.py` | `_try_reconnect_streams_async()` starts daemon thread; `_try_reconnect_streams()` reinits PyAudio and reopens streams |
+| USB watcher calls `on_usb_disconnect` | `recorder.py` | `_usb_watcher_loop` calls `engine.on_usb_disconnect()` immediately on USB removal |
+| USB reconnect | `recorder.py` | `_on_usb_reconnect` calls `_try_reconnect_streams_async()` instead of `request_device_switch()` |
+| MP3 + 48 kHz | `config.py`, `config.json` | `format=mp3`, `sample_rate=48000`, `chunk_size=960`, `mp3_bitrate=64` |
+
+### New log patterns
+
+| Pattern | Meaning |
+|---|---|
+| `[LATCH] Restored direction from latch` | Crash-recovery: direction recovered from prior session |
+| `REC → USB disconnect handled \| streams detached` | Streams nulled; record loop will write silence |
+| `REC → loopback stream reopened after reconnect` | Loopback reopen succeeded |
+| `REC → mic stream reopened after reconnect` | Mic reopen succeeded |
+
+---
+
 ## 2026-05-07 final² — Immediate ENDED return, async mute health-check, terminal finalize ownership
 
 ### Root causes (from live log)

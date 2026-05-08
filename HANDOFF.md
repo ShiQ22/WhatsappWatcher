@@ -138,6 +138,50 @@ post-terminal cooldown (previously only `incoming`, `outgoing`, `answered`, `con
   in `__init__` ONLY — never in `_reset_internal_state`.
 - `current_session_generation` must be reset to 0 in EVERY path that resets `current_session_hwnd`.
 
+## Direction no-downgrade guard (2026-05-08)
+
+`_should_update_direction(new_dir, current_dir)` in `main.py`:
+- Returns `False` when `new_dir == "unknown"` and `current_dir` is `"incoming"` or `"outgoing"`.
+- Applied to **both** direction propagation blocks: pre-transition (line ~1199) and post-transition.
+- **Do NOT replace this with a bare truthy check** — `"unknown"` is truthy.
+
+## Session direction latch (2026-05-08)
+
+File: `data/active_call_session.json`
+- Written when direction first becomes proven in a session (`_direction_latched` gate).
+- Restored on crash-restart on the first `is_new_call_event` where hwnd or
+  session_generation matches the latch AND `saved_at` is within 3600 s.
+- Cleared (file deleted) after every finalize-thread `.start()` call in ALL paths:
+  terminal, split, crash, orphan, shutdown.
+- `_direction_latched` is a `run()` scope bool, reset to `False` in every clear path.
+- **Never** restore from latch for a clearly new call (no hwnd/gen match).
+
+## USB hot-swap design (2026-05-08)
+
+### Disconnect path (USB removed)
+
+1. `Recorder._usb_watcher_loop` detects removal → calls `self._engine.on_usb_disconnect()`.
+2. `CaptureEngine.on_usb_disconnect()`:
+   - Under lock: saves refs, nulls `_loopback_stream` / `_stream` / `_mic_stream`.
+   - Outside lock: calls `stop_stream()` on saved refs — NO `close()`.
+3. `_record_loop` sees both streams `None`:
+   - Writes silence bytes to WAV (preserves wall-clock duration).
+   - Calls `_try_reconnect_streams_async()` (non-blocking).
+   - Sleeps `chunk_size / mix_rate` seconds, then `continue`s.
+
+### Reconnect path (USB returned)
+
+1. `_usb_watcher_loop` detects return → calls `_on_usb_reconnect()`.
+2. `_on_usb_reconnect()` calls `self._engine._try_reconnect_streams_async()`.
+3. `_try_reconnect_streams_async()` starts daemon thread (throttled: 2 s min interval).
+4. `_try_reconnect_streams()` (daemon): reinitializes PyAudio, reopens loopback and mic.
+
+**Rules:**
+- NEVER call `close()` on a WASAPI stream after USB removal — access violation risk.
+- NEVER call `pa.open()` on the record-loop thread — it can block for 20-30 s.
+- `_reconnect_lock` prevents two reconnect threads starting simultaneously.
+- `_try_reconnect_streams_async` is throttled to avoid rapid retry loops.
+
 ## What NOT to change casually
 
 | Area | Reason |
@@ -150,6 +194,9 @@ post-terminal cooldown (previously only `incoming`, `outgoing`, `answered`, `con
 | `detector.reset()` in split path | Must NOT be called; detector already tracks the new window |
 | Async recorder start | Must NOT reintroduce unless it includes a session token/cancel mechanism. Previous async start caused orphan recordings when the session reset while start was in-flight. |
 | `_do_mute_check` in bg thread | Must remain in daemon thread — UIA traversal takes 20-30 s and must never block `start_recording()` return |
+| `close()` on USB removal path | Must NOT call `stream.close()` after USB removal — WASAPI topology is gone; triggers access violation |
+| `_try_reconnect_streams` on record thread | Must NOT call `pa.open()` on the record-loop thread — blocks 20-30 s; always use `_try_reconnect_streams_async()` |
+| Direction propagation truthy check | Must use `_should_update_direction()` — plain `if result.direction` passes `"unknown"` which can overwrite proven direction |
 
 ## Log codes
 
@@ -164,6 +211,7 @@ post-terminal cooldown (previously only `incoming`, `outgoing`, `answered`, `con
 | `[REC-012]` | Orphan recorder guard fired — recorder was running with no live session; stopped immediately |
 | `[DEV-USB]` | USB audio device state change |
 | `[DEV-003]` | No input device |
+| `[LATCH]` | Session direction latch: save / restore / clear events |
 
 ## How to run
 

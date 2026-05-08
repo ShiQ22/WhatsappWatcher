@@ -21,6 +21,47 @@ microphone).
   segment index allocated on each recovery. Gives up after
   `RECORDER_WATCHDOG_RECOVERY_ATTEMPTS`.
 
+## Direction no-downgrade guard + session latch (2026-05-08)
+
+**Guard**: `_should_update_direction(new_dir, current_dir)` returns `False` when
+`new_dir == "unknown"` and `current_dir` is `"incoming"` or `"outgoing"`.
+Applied to both direction-propagation blocks in `main.py run()`.
+
+**Session latch** (`data/active_call_session.json`):
+- Saved when direction first proven (gate: `_direction_latched` flag in `run()` scope).
+- Restored on crash-restart if hwnd or session_generation matches and `saved_at` <= 3600 s ago.
+- Cleared (file deleted) immediately after each finalize thread `.start()` in ALL paths.
+- `_direction_latched` reset to `False` in every latch-clear path.
+
+**Critical rule**: never restore latch for a clearly new call (no hwnd/gen match).
+
+## USB hot-swap fix (2026-05-08)
+
+**Root cause 1 — access violation**: `pyaudiowpatch.read()` on a dead WASAPI stream
+after USB removal can crash the process (Windows C-level fault, uncatchable).
+Fix: `CaptureEngine.on_usb_disconnect()` nulls stream refs under lock before the record
+loop can read them.  `stop_stream()` only — never `close()` after USB removal.
+
+**Root cause 2 — short WAV**: record loop broke out when both streams were `None`.
+Fix: writes silence, calls `_try_reconnect_streams_async()`, sleeps, continues.
+WAV wall-clock duration is preserved.
+
+**Root cause 3 — robotic mic after reconnect**: `_on_usb_reconnect` triggered watchdog
+path which only worked when the record thread was dead.
+Fix: `_try_reconnect_streams_async()` / `_try_reconnect_streams()` always reopens
+loopback + mic unconditionally after reinit_pyaudio().
+
+**Critical rules**:
+- NEVER `close()` a WASAPI stream after USB removal.
+- NEVER call `pa.open()` on the record-loop thread (blocks 20-30 s).
+- `_try_reconnect_streams_async()` is throttled: 2 s min between attempts.
+
+## MP3 / 48 kHz output (2026-05-08)
+
+Config: `format=mp3`, `sample_rate=48000`, `chunk_size=960`, `mp3_bitrate=64`.
+USB device native rate is 48000 Hz; 44100 was always being auto-rejected and falling back.
+MP3 @ 64 kbps is transparent for voice and reduces file size ~4× vs WAV.
+
 ## Immediate ENDED return + terminal finalize ownership fix (2026-05-07)
 
 **Root cause 1 — 33-second delay:** `ensure_recording_alive()` called `_do_mute_check()` synchronously.
@@ -158,3 +199,4 @@ is False — stops orphan recorder immediately and finalizes.
 | `[UPL-004]` | Local recording file missing at upload time |
 | `SESSION SPLIT` | Back-to-back call boundary detected; old session finalized |
 | `CALL END` | Terminal state reached; finalize thread spawned |
+| `[LATCH]` | Session direction latch: save / restore / clear events |

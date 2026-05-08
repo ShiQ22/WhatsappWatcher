@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import logging
 import os
 import queue
@@ -23,6 +24,7 @@ from config import (
     ALLOWED_MEDIA_EXTENSIONS,
     CENTRAL_SYNC_INTERVAL_SECONDS,
     CONFIG_LOAD_ERROR,
+    DATA_DIR,
     LOCAL_CLEANUP_INTERVAL_SECONDS,
     LOG_BACKUP_COUNT,
     LOG_DIR,
@@ -882,6 +884,58 @@ _TERMINAL_STATES: frozenset = frozenset({
     CallState.DETECTOR_ERROR,
 })
 
+_LATCH_PATH = DATA_DIR / "active_call_session.json"
+
+
+def _should_update_direction(new_dir: Optional[str], current_dir: Optional[str]) -> bool:
+    """Return True only when new_dir is a genuine improvement over current_dir.
+    "unknown" must never overwrite a proven "incoming"/"outgoing" direction.
+    """
+    if not new_dir:
+        return False
+    if new_dir == current_dir:
+        return False
+    if new_dir == "unknown" and current_dir in ("incoming", "outgoing"):
+        return False
+    return True
+
+
+def _save_session_latch(
+    direction: str,
+    hwnd: Optional[int],
+    session_generation: int,
+    started_at,
+) -> None:
+    try:
+        data = {
+            "direction": direction,
+            "hwnd": hwnd,
+            "session_generation": session_generation,
+            "started_at": started_at.isoformat() if hasattr(started_at, "isoformat") else str(started_at),
+            "saved_at": datetime.now().isoformat(),
+        }
+        _LATCH_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        log.exception("[LATCH] Failed to save session latch")
+
+
+def _load_session_latch() -> Optional[dict]:
+    try:
+        if not _LATCH_PATH.exists():
+            return None
+        return json.loads(_LATCH_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _clear_session_latch() -> None:
+    try:
+        if _LATCH_PATH.exists():
+            _LATCH_PATH.unlink()
+    except Exception:
+        log.exception("[LATCH] Failed to clear session latch")
+
+
 def _prune_finalize_threads(threads: set[threading.Thread]) -> None:
     """Remove completed finalize threads from the tracking set."""
     done = {t for t in threads if not t.is_alive()}
@@ -966,6 +1020,13 @@ def run() -> None:
     finalize_threads: set[threading.Thread] = set()
     sync_lock = threading.Lock()
     cleanup_lock = threading.Lock()
+    _direction_latched: bool = False
+    _startup_latch: Optional[dict] = _load_session_latch()
+    if _startup_latch:
+        log.info(
+            "[LATCH] Found active session latch at startup | direction=%s | saved_at=%s",
+            _startup_latch.get("direction"), _startup_latch.get("saved_at"),
+        )
 
     # Recover any orphan seg1.wav files from crashes before finalization
     orphan_count = _recover_orphan_seg_files(recorder, storage)
@@ -1132,11 +1193,53 @@ def run() -> None:
                         )
                     finalize_threads.add(split_t)
                     split_t.start()
+                    _clear_session_latch()
+                    _direction_latched = False
                     log.info("SESSION SPLIT → old session finalized; processing new ring as fresh call")
 
-                # Propagate direction / caller into session (best-effort)
-                if result.direction and result.direction != sm.session.direction:
+                # ── Latch restore (crash-recovery only, first ring after restart) ──
+                # If we crashed mid-call, a proven direction was saved to the latch.
+                # Restore it only when hwnd or session_generation matches the latch,
+                # confirming this ring event belongs to the same ongoing call.
+                if is_new_call_event and _startup_latch is not None and not _direction_latched:
+                    _latch_dir = _startup_latch.get("direction", "")
+                    _latch_hwnd = _startup_latch.get("hwnd")
+                    _latch_gen = _startup_latch.get("session_generation", 0)
+                    _latch_saved_str = _startup_latch.get("saved_at", "")
+                    try:
+                        _latch_ts = datetime.fromisoformat(_latch_saved_str)
+                        _freshness_ok = (datetime.now() - _latch_ts).total_seconds() <= 3600
+                    except Exception:
+                        _freshness_ok = False
+                    _hwnd_match = (_latch_hwnd is not None and result_hwnd is not None
+                                   and _latch_hwnd == result_hwnd)
+                    _gen_match = (_latch_gen != 0
+                                  and getattr(result, "session_generation", 0) != 0
+                                  and getattr(result, "session_generation", 0) == _latch_gen)
+                    if (_freshness_ok and (_hwnd_match or _gen_match)
+                            and _latch_dir in ("incoming", "outgoing")
+                            and result.direction in (None, "unknown")):
+                        result.direction = _latch_dir
+                        log.info(
+                            "[LATCH] Restored direction from latch | dir=%s"
+                            " | hwnd_match=%s | gen_match=%s",
+                            _latch_dir, _hwnd_match, _gen_match,
+                        )
+                    _startup_latch = None  # consume once regardless of match
+
+                # Propagate direction / caller into session (best-effort).
+                # _should_update_direction guards against "unknown" overwriting
+                # a proven direction.
+                if _should_update_direction(result.direction, sm.session.direction):
                     sm.session.direction = result.direction
+                    if sm.session.direction in ("incoming", "outgoing") and not _direction_latched:
+                        _save_session_latch(
+                            sm.session.direction,
+                            current_session_hwnd,
+                            current_session_generation,
+                            sm.session.started_at,
+                        )
+                        _direction_latched = True
                 if result.caller_number:
                     sm.session.caller_number = result.caller_number
 
@@ -1196,6 +1299,8 @@ def run() -> None:
                         )
                     finalize_threads.add(t)
                     t.start()
+                    _clear_session_latch()
+                    _direction_latched = False
                     time.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -1219,9 +1324,19 @@ def run() -> None:
                     current_session_hwnd = result_hwnd
                     current_session_generation = getattr(result, "session_generation", 0)
 
-                # Re-apply direction after transition (state machine may have reset)
-                if result.direction and result.direction != sm.session.direction:
+                # Re-apply direction after transition (state machine may have reset).
+                # _should_update_direction guards against "unknown" overwriting
+                # a proven direction.
+                if _should_update_direction(result.direction, sm.session.direction):
                     sm.session.direction = result.direction
+                    if sm.session.direction in ("incoming", "outgoing") and not _direction_latched:
+                        _save_session_latch(
+                            sm.session.direction,
+                            current_session_hwnd,
+                            current_session_generation,
+                            sm.session.started_at,
+                        )
+                        _direction_latched = True
                 if result.caller_number:
                     sm.session.caller_number = result.caller_number
 
@@ -1298,6 +1413,8 @@ def run() -> None:
                         )
                     finalize_threads.add(_orph_t)
                     _orph_t.start()
+                    _clear_session_latch()
+                    _direction_latched = False
                     if sm.state not in _TERMINAL_STATES:
                         sm.transition(CallEvent.RESET)
                         current_session_hwnd = None
@@ -1348,6 +1465,8 @@ def run() -> None:
                         )
                     finalize_threads.add(t)
                     t.start()
+                    _clear_session_latch()
+                    _direction_latched = False
                     log.info("STATE    → reset to idle (finalize running in background)")
 
                 time.sleep(POLL_INTERVAL_SECONDS)
@@ -1376,6 +1495,8 @@ def run() -> None:
                             )
                             finalize_threads.add(t)
                             t.start()
+                            _clear_session_latch()
+                            _direction_latched = False
                 except Exception:
                     log.exception("RECORDER → failed to stop after main-loop exception")
 
@@ -1416,6 +1537,7 @@ def run() -> None:
                     )
                     finalize_threads.add(t)
                     t.start()
+                    _clear_session_latch()
             except Exception:
                 log.exception("SHUTDOWN → failed to finalize active recording")
 

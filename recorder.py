@@ -422,6 +422,10 @@ class CaptureEngine:
         self._silent_secs: int = 0
         self._record_started_monotonic: float = 0.0
 
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_thread: Optional[threading.Thread] = None
+        self._last_reconnect_attempt_ts: float = 0.0
+
     # ── public API ───────────────────────────────────────────────────────────
 
     @property
@@ -639,6 +643,102 @@ class CaptureEngine:
             " | watchdog will restart on best device",
             self._device_name,
         )
+
+    def on_usb_disconnect(self) -> None:
+        """
+        Called immediately when the USB audio device is removed.
+        Nulls stream references under lock so the record loop never reads a
+        dead WASAPI stream (which would cause a Windows access violation).
+        Does NOT call close() — the OS WASAPI topology has already changed;
+        close() can access-violate on a removed device.  stop_stream() is
+        best-effort only.
+        """
+        with self._lock:
+            lb = self._loopback_stream
+            mic = self._stream
+            self._loopback_stream = None
+            self._stream = None
+            self._mic_stream = None
+
+        for s in (lb, mic):
+            if s is not None:
+                try:
+                    s.stop_stream()
+                except Exception:
+                    pass
+
+        log.info(
+            "REC → USB disconnect handled | streams detached"
+            " | record loop will write silence until reconnect"
+        )
+
+    def _try_reconnect_streams_async(self) -> None:
+        """
+        Starts a non-blocking daemon thread to reopen streams after USB
+        device return.  If a reconnect thread is already running, does nothing.
+        """
+        now = time.monotonic()
+        with self._reconnect_lock:
+            if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+                return
+            # Throttle: don't start a new attempt within 2 s of the last one
+            if now - self._last_reconnect_attempt_ts < 2.0:
+                return
+            self._last_reconnect_attempt_ts = now
+            t = threading.Thread(
+                target=self._try_reconnect_streams,
+                daemon=True,
+                name="CaptureEngineReconnect",
+            )
+            self._reconnect_thread = t
+        t.start()
+
+    def _try_reconnect_streams(self) -> None:
+        """
+        Runs in a daemon thread.  Reinitializes PyAudio and reopens loopback
+        and/or mic streams that were nulled by on_usb_disconnect().
+        """
+        try:
+            log.info("REC → reconnect thread: reinitializing PyAudio")
+            self._device_manager.reinit_pyaudio()
+
+            with self._lock:
+                need_lb = self._loopback_stream is None
+                need_mic = self._stream is None
+
+            if need_lb:
+                new_lb = self._open_loopback_stream()
+                if new_lb:
+                    with self._lock:
+                        if self._loopback_stream is None:
+                            self._loopback_stream = new_lb
+                            self._mix_rate = self._loopback_rate
+                    log.info("REC → loopback stream reopened after reconnect")
+                else:
+                    log.warning(
+                        "REC → loopback reopen failed — record loop continues with silence"
+                    )
+
+            if need_mic:
+                device = self._device_manager.select_best_device()
+                if device:
+                    with self._lock:
+                        self._device = device
+                        self._device_name = str(device.get("name", "?"))
+                    if self._open_stream(device):
+                        log.info(
+                            "REC → mic stream reopened after reconnect | device=%s",
+                            self._device_name,
+                        )
+                    else:
+                        log.warning(
+                            "REC → mic reopen failed — record loop continues with silence"
+                        )
+                else:
+                    log.warning("REC → no mic device available during reconnect")
+
+        except Exception:
+            log.exception("REC → reconnect thread failed")
 
     def convert_to_mp3(self, wav_path: str) -> Optional[str]:
         """Public wrapper — used by Recorder.resolve_final_files()."""
@@ -1042,10 +1142,18 @@ class CaptureEngine:
                             log.exception("[REC-005] Mic read failed")
                             self._stream = None
 
-                    # ── Both streams gone: exit ───────────────────────────────
+                    # ── Both streams gone: write silence + wait for reconnect ────
                     if self._loopback_stream is None and self._stream is None:
-                        log.warning("[REC-004] Both streams lost — exiting record loop")
-                        break
+                        silence = b"\x00" * (self._chunk_size * self._sample_width)
+                        try:
+                            self._wav_file.writeframes(silence)
+                            self._bytes_written += len(silence)
+                        except Exception:
+                            log.exception("[REC-004] WAV silence write failed — exiting record loop")
+                            break
+                        self._try_reconnect_streams_async()
+                        time.sleep(max(0.005, self._chunk_size / max(1, self._mix_rate)))
+                        continue
 
                     # ── Mix ───────────────────────────────────────────────────
                     if loopback_data and mic_data:
@@ -1669,6 +1777,8 @@ class Recorder:
                         "[DEV-USB] USB audio device disconnected"
                         " | monitoring for return every 2s"
                     )
+                    if self._engine.is_active:
+                        self._engine.on_usb_disconnect()
                 elif has_usb and not last_had_usb:
                     log.info("[DEV-USB] USB audio device reconnected")
                     self._on_usb_reconnect()
@@ -1689,7 +1799,7 @@ class Recorder:
     def _on_usb_reconnect(self) -> None:
         """
         Called by _usb_watcher_loop when USB device returns after absence.
-        If recording on a non-USB fallback: requests switch to USB.
+        If recording: triggers non-blocking stream reconnect.
         If not recording: logs only — next call will use USB automatically.
         """
         try:
@@ -1702,20 +1812,10 @@ class Recorder:
                 )
                 return
 
-            current = self._engine.device_name
-            if "usb" in current.lower():
-                log.info(
-                    "[DEV-USB] USB audio device reconnected — already recording on USB: %s",
-                    current,
-                )
-                return
-
             log.info(
-                "[DEV-USB] USB audio device reconnected — switching recording input back to USB headset"
-                " | was_on=%s",
-                current,
+                "[DEV-USB] USB audio device reconnected — triggering stream reconnect"
             )
-            self._engine.request_device_switch()
+            self._engine._try_reconnect_streams_async()
 
         except Exception:
             log.exception("[DEV-CHG] USB reconnect handler failed")
