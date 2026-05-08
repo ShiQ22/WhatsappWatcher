@@ -236,6 +236,7 @@ def _finalize_call(
         log.info("FINALIZE → saving to local DB")
         call_local_id = storage.save_call(session_snap)
         log.info("FINALIZE → saved to local DB (id=%s)", call_local_id)
+        _maybe_clear_latch_for_session(session_snap)
 
         uploaded_paths = []
         for idx, rec_path in enumerate(renamed_paths, start=1):
@@ -288,6 +289,7 @@ def _finalize_no_recording(
             getattr(session_snap, "caller_number", None) or "-",
         )
         storage.save_call(session_snap)
+        _maybe_clear_latch_for_session(session_snap)
         reporter.append_call(session_snap)
         log.info(
             "FINALIZE → complete (no recording) | status=%s | dir=%s | dur=%ss | number=%s | ip=%s",
@@ -936,6 +938,27 @@ def _clear_session_latch() -> None:
         log.exception("[LATCH] Failed to clear session latch")
 
 
+def _maybe_clear_latch_for_session(session_snap) -> None:
+    """Clear the active session latch only if it belongs to this session.
+    Compares started_at so a newer session's latch is never deleted by an
+    older finalize thread running concurrently.
+    """
+    try:
+        latch = _load_session_latch()
+        if latch is None:
+            return
+        latch_started = latch.get("started_at", "")
+        sa = getattr(session_snap, "started_at", None)
+        if sa is None:
+            return
+        snap_started = sa.isoformat() if hasattr(sa, "isoformat") else str(sa)
+        if latch_started and snap_started and latch_started == snap_started:
+            _clear_session_latch()
+            log.debug("[LATCH] Cleared after DB save | started_at=%s", snap_started)
+    except Exception:
+        log.exception("[LATCH] Failed to check/clear session latch in finalize")
+
+
 def _prune_finalize_threads(threads: set[threading.Thread]) -> None:
     """Remove completed finalize threads from the tracking set."""
     done = {t for t in threads if not t.is_alive()}
@@ -1193,8 +1216,6 @@ def run() -> None:
                         )
                     finalize_threads.add(split_t)
                     split_t.start()
-                    _clear_session_latch()
-                    _direction_latched = False
                     log.info("SESSION SPLIT → old session finalized; processing new ring as fresh call")
 
                 # ── Latch restore (crash-recovery only, first ring after restart) ──
@@ -1299,8 +1320,6 @@ def run() -> None:
                         )
                     finalize_threads.add(t)
                     t.start()
-                    _clear_session_latch()
-                    _direction_latched = False
                     time.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -1323,6 +1342,7 @@ def run() -> None:
                 if is_new_call_event and result_hwnd:
                     current_session_hwnd = result_hwnd
                     current_session_generation = getattr(result, "session_generation", 0)
+                    _direction_latched = False  # new session; allow its latch to be saved
 
                 # Re-apply direction after transition (state machine may have reset).
                 # _should_update_direction guards against "unknown" overwriting
@@ -1413,8 +1433,6 @@ def run() -> None:
                         )
                     finalize_threads.add(_orph_t)
                     _orph_t.start()
-                    _clear_session_latch()
-                    _direction_latched = False
                     if sm.state not in _TERMINAL_STATES:
                         sm.transition(CallEvent.RESET)
                         current_session_hwnd = None
@@ -1465,8 +1483,6 @@ def run() -> None:
                         )
                     finalize_threads.add(t)
                     t.start()
-                    _clear_session_latch()
-                    _direction_latched = False
                     log.info("STATE    → reset to idle (finalize running in background)")
 
                 time.sleep(POLL_INTERVAL_SECONDS)
@@ -1495,8 +1511,6 @@ def run() -> None:
                             )
                             finalize_threads.add(t)
                             t.start()
-                            _clear_session_latch()
-                            _direction_latched = False
                 except Exception:
                     log.exception("RECORDER → failed to stop after main-loop exception")
 
@@ -1537,7 +1551,6 @@ def run() -> None:
                     )
                     finalize_threads.add(t)
                     t.start()
-                    _clear_session_latch()
             except Exception:
                 log.exception("SHUTDOWN → failed to finalize active recording")
 

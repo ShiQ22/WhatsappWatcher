@@ -699,33 +699,88 @@ class CaptureEngine:
         and/or mic streams that were nulled by on_usb_disconnect().
         """
         try:
+            # 1. Early bail if recorder is stopping
+            if self._stop_event.is_set():
+                return
+
+            # 2. Under lock: check stop and determine what is actually missing.
+            #    Do this BEFORE reinit so we don't disturb live streams.
+            with self._lock:
+                if self._stop_event.is_set():
+                    return
+                need_lb = self._loopback_stream is None
+                need_mic = self._stream is None
+
+            if not need_lb and not need_mic:
+                log.info("REC → reconnect skipped; streams already active")
+                return
+
+            # 3. Only reinit if something is missing
+            if self._stop_event.is_set():
+                return
             log.info("REC → reconnect thread: reinitializing PyAudio")
             self._device_manager.reinit_pyaudio()
 
-            with self._lock:
-                need_lb = self._loopback_stream is None
-                need_mic = self._stream is None
+            # 4. Stop check after reinit
+            if self._stop_event.is_set():
+                return
 
             if need_lb:
                 new_lb = self._open_loopback_stream()
                 if new_lb:
+                    assigned = False
                     with self._lock:
-                        if self._loopback_stream is None:
+                        if self._stop_event.is_set():
+                            # Recorder is stopping; close the newly opened stream
+                            # (this is a valid stream we own — safe to close)
+                            pass
+                        elif self._loopback_stream is None:
                             self._loopback_stream = new_lb
                             self._mix_rate = self._loopback_rate
-                    log.info("REC → loopback stream reopened after reconnect")
+                            assigned = True
+                        else:
+                            # Another path already assigned a stream; discard ours
+                            pass
+                    if not assigned:
+                        try:
+                            new_lb.stop_stream()
+                            new_lb.close()
+                        except Exception:
+                            pass
+                        if self._stop_event.is_set():
+                            return
+                    else:
+                        log.info("REC → loopback stream reopened after reconnect")
                 else:
                     log.warning(
                         "REC → loopback reopen failed — record loop continues with silence"
                     )
 
             if need_mic:
+                if self._stop_event.is_set():
+                    return
                 device = self._device_manager.select_best_device()
                 if device:
                     with self._lock:
                         self._device = device
                         self._device_name = str(device.get("name", "?"))
-                    if self._open_stream(device):
+                    opened = self._open_stream(device)  # sets self._stream on success
+                    if opened:
+                        discard_stream = None
+                        with self._lock:
+                            if self._stop_event.is_set():
+                                discard_stream = self._stream
+                                self._stream = None
+                                self._mic_stream = None
+                            else:
+                                self._mic_stream = self._stream
+                        if discard_stream is not None:
+                            try:
+                                discard_stream.stop_stream()
+                                discard_stream.close()
+                            except Exception:
+                                pass
+                            return
                         log.info(
                             "REC → mic stream reopened after reconnect | device=%s",
                             self._device_name,

@@ -141,11 +141,11 @@ Rationale:
 
 4. **Normal call cycle** — single outgoing and single incoming call.
    - Expected: recordings saved as `.mp3` files (not `.wav`).
-   - Expected: file size roughly 30–60 KB/minute (vs ~2 MB/minute for WAV).
+   - Expected: file size roughly 480 KB/minute (64 kbps ≈ 3 MB for a 6-minute call), vs ~11 MB/minute for WAV @ 48 kHz mono 16-bit.
 
 5. **Back-to-back calls still split** — existing regression from 2026-05-07 fix.
    - Expected: two separate records and two files per back-to-back pair.
 
 ## Git commit hash
 
-(populated after commit)
+`deb076d` — pushed to `origin/main`
