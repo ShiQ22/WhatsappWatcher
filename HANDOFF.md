@@ -13,25 +13,29 @@ launcher.py
         └── uploader.py      → copies recording files to network share
 ```
 
-### recorder.py internal architecture (as of 2026-05-08 rev2)
+### recorder.py internal architecture (as of 2026-05-08 rev3)
 
 Three independent daemon threads inside `CaptureEngine`:
 
 ```
-LoopbackReader (_SourceReader) ──── _lb_buf (_FrameBuffer) ────┐
-                                                                ├─► _AudioWriter
-MicReader      (_SourceReader) ──── _mic_buf (_FrameBuffer) ───┘    (wall-clock WAV writes)
+LoopbackReader (_SourceReader) ──── _lb_buf (_JitterBuffer, maxlen=4) ────┐
+                                                                           ├─► _AudioWriter
+MicReader      (_SourceReader) ──── _mic_buf (_JitterBuffer, maxlen=4) ───┘    (wall-clock WAV writes)
 ```
 
-- Reader threads own blocking `stream.read()`. Writer never calls `stream.read()`.
-- Each reader is **paced**: `stop_event.wait(source_block_seconds - elapsed)` after every push.
-  Prevents queue flooding when `stream.read()` returns faster than real-time.
-- Writer pulls with `pop_latest_or_silence()` — **newest frame**, discards stale ones.
-  Prevents delayed/echo audio from queue backlog.
+- Reader threads use a **non-blocking poll loop**: check `get_read_available()` every 2ms up to
+  one full chunk budget. If frames ready → read immediately. If budget exhausted → push silence frame
+  (underflow), pace, continue. Falls back to blocking read if `get_read_available` unsupported.
+- Writer pulls with `pop_or_hold()` — **FIFO (oldest-first)**, holds last-good frame up to
+  `MAX_HOLD=1` tick on underrun, then silence. Prevents both stale-echo and duty-cycle holes.
+- Writer startup: `next_tick = time.monotonic() + block_seconds` (one tick head-start before first pop).
+- MicReader: per-second L/R channel analysis → `_mic_ch_mode` (`left`/`right`/`average`).
+  Chooses stronger channel when one is 4× the other; averages when correlated.
 - Gain mixing: `int(lb * loopback_gain + mic * mic_gain)`, clamped int16.
 - WAV written with `writeframesraw()`; `wave.close()` finalises header.
-- On USB disconnect: `reader.go_offline()` unblocks blocking reads, writer fills silence.
-- On reconnect: `reader.set_stream(new_stream, ...)` injects new stream into running reader.
+- On USB disconnect: `reader.go_offline()` unblocks reads, writer fills silence.
+- On reconnect: evidence-based — `get_fresh_usb_mic_name_if_missing()` confirms mismatch
+  before forcing PyAudio reinit. `reader.set_stream()` injects new stream into running thread.
 - `_record_thread` points to the writer thread (watchdog compatibility).
 - `_reconnect_disabled` set `True` by `stop()` under lock before `stop_event.set()`.
   Prevents reconnect thread from opening streams during finalization.

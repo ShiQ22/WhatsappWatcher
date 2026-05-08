@@ -1,13 +1,13 @@
 # Skill: Audio capture + WAV/MP3 output
 
-## Three-thread capture architecture (current as of 2026-05-08)
+## Three-thread capture architecture (current as of 2026-05-08 rev3)
 
 `_record_loop` has been removed. CaptureEngine now uses three independent threads:
 
 | Thread | Class | Role |
 |--------|-------|------|
-| LoopbackReader | `_SourceReader` | Blocking `stream.read()` for WASAPI loopback only |
-| MicReader | `_SourceReader` | Blocking `stream.read()` for mic only |
+| LoopbackReader | `_SourceReader` | Non-blocking-poll read for WASAPI loopback |
+| MicReader | `_SourceReader` | Non-blocking-poll read for mic; per-second L/R channel analysis |
 | Writer | `_AudioWriter` | `time.monotonic()` wall-clock scheduling; WAV writes; never calls `stream.read()` |
 
 The writer thread is stored in `_record_thread` for watchdog compatibility.
@@ -16,26 +16,30 @@ The writer thread is stored in `_record_thread` for watchdog compatibility.
 
 `loopback.read()` can block for 2+ seconds on a WASAPI stall. When the reader and writer shared one thread, the WAV grew at ~0.63× wall-clock rate (confirmed: `[REC-013] writer lag | behind_ms=2090.0`). Separate threads let the writer schedule at exact 20ms intervals regardless of source read timing.
 
-## _FrameBuffer
+### Why non-blocking readers (rev3)
 
-Thread-safe frame store shared between one `_SourceReader` and `_AudioWriter`.
+Blocking `stream.read(chunk)` takes exactly `chunk_seconds` to return when the buffer is freshly drained. `sleep_for = chunk_seconds - elapsed ≈ 0` → immediate re-read → WASAPI ring buffer just drained → blocks again for another full period → alternating real/silence frames. Confirmed: 92-93% of active audio runs ≤ 40ms in both sources. Non-blocking poll loop with `get_read_available()` eliminates this by waiting up to the chunk budget before reading, or pushing silence on timeout.
+
+## _JitterBuffer
+
+Thread-safe FIFO buffer shared between one `_SourceReader` and `_AudioWriter`. Replaces `_FrameBuffer`.
 
 ```python
-buf = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
-buf.push(frame)                        # drops oldest + logs [REC-014] on overflow
-frame, dropped = buf.pop_latest_or_silence(silence)  # newest frame; discards older
-buf.clear()
-len(buf)
+buf = _JitterBuffer(maxlen=4, source_name="LoopbackReader")
+buf.push(frame)          # drops oldest + logs [REC-014] (throttled 1s) on overflow
+frame, status = buf.pop_or_hold(source_online, last_frame, silence)
+# status: "ok" | "hold" | "offline"
+# "hold": buffer empty but source online — returns last_frame (up to MAX_HOLD=1 tick)
+# "offline": source offline — returns silence
 ```
 
-`pop_latest_or_silence()` always returns the most recent frame.  `dropped` is the
-number of older frames discarded in the same call.  This prevents stale/delayed audio.
+FIFO (oldest-first) maintains audio continuity. MAX_HOLD=1 means after 1 tick of underrun
+the writer switches to silence rather than repeating stale audio.
 
 ## _SourceReader
 
 ```python
-# Per-source thread. Reads one chunk, downmixes, resamples, pushes to _FrameBuffer.
-# Paced to one chunk per source_block_seconds to prevent buffer flooding.
+# Per-source thread. Non-blocking poll then read; downmixes; resamples; pushes to _JitterBuffer.
 reader = _SourceReader(
     name="LoopbackReader",          # or "MicReader"
     stop_event=stop_event,
@@ -44,16 +48,28 @@ reader = _SourceReader(
     source_channels=2,              # stream's native channel count
     source_rate=48000,              # stream's native sample rate
     mix_rate=48000,                 # output/WAV rate
-    frame_buf=lb_buf,               # _FrameBuffer owned by engine
+    frame_buf=lb_buf,               # _JitterBuffer owned by engine
 )
 reader.set_stream(stream, source_channels, source_rate)  # inject stream
 reader.go_offline()   # unblocks read() via stop_stream(), marks offline
 reader.is_online      # property
 ```
 
-Pacing: `stop_event.wait(chunk_size/source_rate - elapsed)` after each push.
-Overflow logged `[REC-014]` inside `_FrameBuffer.push()`.
-Pace lag logged `REC → source pace lag` if `elapsed > 1.5 × source_block_seconds`.
+**Non-blocking poll loop (per tick):**
+1. Poll `get_read_available()` every 2ms up to `max_polls = int(source_block_seconds / 0.002)`.
+2. If `avail >= chunk_size`: exit poll loop, read immediately.
+3. If budget exhausted: push `silence_raw` frame, log underflow (throttled), pace, `continue`.
+4. If `get_read_available()` raises: set `_get_avail_unsupported = True`, fall through to blocking read.
+
+**MicReader channel mode (per-second window):**
+Accumulate L², R², LR cross-products. Every 1s compute L_rms, R_rms, LR_corr.
+- If `min/max < 0.25`: use stronger channel
+- Elif `corr >= 0.5`: average both channels
+- Else: use stronger channel
+Mode logged on change as `REC → mic channel mode | mode=... | L_rms=... | R_rms=... | corr=...`.
+
+Overflow logged `[REC-014]` inside `_JitterBuffer.push()`.
+Underflow logged `REC → source underflow | source=... | unavailable_ticks=N` (throttled 4s).
 
 ## _AudioWriter
 
@@ -61,8 +77,8 @@ Pace lag logged `REC → source pace lag` if `elapsed > 1.5 × source_block_seco
 # Writer thread. Wall-clock scheduled, never calls stream.read().
 writer = _AudioWriter(
     stop_event=stop_event,
-    lb_buf=lb_buf,               # _FrameBuffer
-    mic_buf=mic_buf,             # _FrameBuffer
+    lb_buf=lb_buf,               # _JitterBuffer
+    mic_buf=mic_buf,             # _JitterBuffer
     wav_file=wav_file,
     chunk_size=960, sample_width=2, mix_rate=48000,
     mic_gain=0.75,               # from config
@@ -77,9 +93,14 @@ writer = _AudioWriter(
 )
 ```
 
-Writer scheduling: absolute `next_tick += block_seconds` each iteration (no drift).
+Writer scheduling: `next_tick = time.monotonic() + block_seconds` (startup head-start, then
+`next_tick += block_seconds` each iteration — absolute, no drift).
 If behind by >10ms, logs `[REC-013]` and resets `next_tick` to prevent catch-up storm.
-Pulls with `pop_latest_or_silence()` — newest frame only, stale frames discarded.
+
+`_MAX_HOLD = 1`: writer holds last good frame for at most 1 tick on underrun, then writes silence.
+Separate `_lb_hold` / `_mic_hold` counters; reset to 0 on each "ok" pop.
+
+Pulls with `pop_or_hold()` — FIFO oldest-first; silence preferred over repeated stale frames.
 Uses `writeframesraw()` for both main WAV and debug stems; `wave.close()` finalises header.
 
 Mixing formula (int32 intermediate, clamped to int16):

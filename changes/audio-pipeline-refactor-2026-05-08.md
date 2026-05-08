@@ -113,3 +113,58 @@ The WAV finalized by the writer's `finally` block is kept as a valid (if short) 
 - `config.json`: added `mic_gain`, `loopback_gain`
 - `recorder_plan/skills/audio-capture.md`: replaced `_record_loop` description with three-thread architecture
 - `CHANGELOG.md`, `HANDOFF.md`, `PROJECT_MEMORY.md`: updated
+
+---
+
+## Rev3: Non-blocking readers, jitter buffer, mic channel mode (2026-05-08)
+
+### Root cause (rev3)
+
+The 50% duty-cycle audio island pattern confirmed by debug stem analysis:
+- Active audio runs ≤ 40ms in 92-93% of cases for **both** mic and loopback sources
+- Root cause: `stream.read(chunk)` takes exactly 20ms → sleep_for = 0 → immediate re-read → WASAPI ring buffer just drained → blocks 20ms → writer sees alternating real/silence frames
+- `_FrameBuffer.pop_latest_or_silence()` made this worse: discarding stale frames left the buffer empty on every other tick, forcing silence output
+
+### Fix (rev3)
+
+**Non-blocking readers (both LoopbackReader and MicReader):**
+- Poll `get_read_available()` every 2ms up to one full chunk budget (20ms)
+- If frames available before budget: read immediately → no blocking
+- If budget exhausted without enough frames: push a silence frame, pace, continue
+- `get_read_available` unsupported: fall through to blocking read (flag `_get_avail_unsupported`)
+
+**_JitterBuffer replaces _FrameBuffer:**
+- FIFO (oldest-first, not pop-latest). maxlen=4 (80ms capacity)
+- `pop_or_hold(source_online, last_frame, silence)`:
+  - Returns oldest queued frame when available ("ok")
+  - Returns last good frame for up to MAX_HOLD=1 tick on underrun ("hold")
+  - Returns silence after MAX_HOLD exceeded or source offline ("offline")
+- Overflow drops oldest (logs [REC-014] throttled 1s)
+
+**Mic channel mode selection (MicReader, per-second window):**
+```python
+L_rms, R_rms, LR_corr computed over 1s
+if max/min > 4: use stronger channel
+elif corr >= 0.5: average
+else: use stronger channel
+```
+Mode logged on change. Accumulators reset each second.
+
+**Evidence-based USB reinit:**
+`DeviceManager.get_fresh_usb_mic_name_if_missing(live_names)` creates a temporary
+`pyaudio.PyAudio()` instance, enumerates input devices, returns any USB/headset mic
+not already in `live_names`. Reinit only triggered on confirmed mismatch.
+
+**Writer startup head-start:**
+`next_tick = time.monotonic() + block_seconds` before the write loop — gives readers
+one full tick to populate their buffers before first pop.
+
+### New symbols (rev3)
+
+| Symbol | Purpose |
+|--------|---------|
+| `_JitterBuffer` | FIFO with hold-last; replaces `_FrameBuffer` |
+| `_SourceReader._get_avail_unsupported` | Fallback to blocking read when API not available |
+| `_SourceReader._mic_ch_mode` | `left`/`right`/`average` — updated per second |
+| `_AudioWriter._MAX_HOLD` | `= 1`; hold last frame at most 1 tick then silence |
+| `DeviceManager.get_fresh_usb_mic_name_if_missing()` | Fresh PA snapshot for USB mismatch detection |

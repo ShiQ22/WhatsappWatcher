@@ -1,5 +1,79 @@
 # Changelog
 
+## 2026-05-08 rev3 — Non-blocking readers, jitter buffer, mic channel mode, evidence-based USB reinit
+
+### Root causes fixed
+
+1. **50% duty-cycle audio islands (both sources):** Both LoopbackReader and MicReader were
+   calling blocking `stream.read(chunk)` then sleeping 0ms (because `elapsed ≈ block_seconds`).
+   On the next read, the WASAPI ring buffer had just been drained → blocked for another full
+   `block_seconds`. Writer received alternating real/silence frames at 20ms granularity:
+   active audio runs ≤40ms in 92-93% of cases (confirmed from debug stems).
+
+   Fix (both readers): Non-blocking poll loop — check `get_read_available()` every 2ms up to
+   one full chunk budget. If insufficient frames after budget: **push silence** (not skip),
+   increment underflow counter. WASAPI loopback is allowed to fall through to blocking read
+   immediately when `get_read_available` is unsupported.
+
+2. **Pop-latest discards valid frames:** `_FrameBuffer.pop_latest_or_silence()` discarded
+   all frames except the newest. When a reader was slightly late delivering its frame, the
+   buffer had only 1 frame → writer took it → next tick buffer empty → silence → 50% pattern.
+
+   Fix: Replace `_FrameBuffer` with `_JitterBuffer` (FIFO, maxlen=4). `pop_or_hold()` returns
+   oldest frame (maintains continuity), holds last-good frame for up to `MAX_HOLD=1` tick on
+   underrun, then silence. Overflow drops oldest (logs `[REC-014]`).
+
+3. **Mic 2-channel mode — wrong channel selected:** Averaging L+R is correct only when both
+   channels carry audio. If only one headset channel has audio (common with mono USB mics),
+   averaging halves the amplitude vs the active channel.
+
+   Fix: Per-1-second window, compute L_rms, R_rms, LR_corr. Use stronger channel if one is
+   4× the other; average if both similar and corr ≥ 0.5; else use stronger channel.
+
+4. **USB reinit on every reconnect attempt:** Prior code called `reinit_pyaudio()` on every
+   reconnect cycle. On a live system with stable USB, this caused unnecessary PA teardown.
+
+   Fix: Evidence-based reinit only. Compare live DeviceManager device names vs a fresh
+   `pyaudio.PyAudio()` snapshot. Only force reinit when fresh PA sees a USB/headset mic
+   that the live instance is missing.
+
+5. **Writer starts before readers have frames:** Writer's first tick fired immediately on
+   thread start, before readers had produced their first frame, causing one silent tick.
+
+   Fix: `next_tick = time.monotonic() + block_seconds` (one tick head-start before first pop).
+
+### Changes
+
+| Symbol | Change |
+|--------|--------|
+| `_JitterBuffer` | Replaces `_FrameBuffer`; FIFO (oldest-first), maxlen=4, `pop_or_hold()` with MAX_HOLD=1 |
+| `_SourceReader._get_avail_unsupported` | Fallback flag: if `get_read_available()` raises, skip to blocking read |
+| `_SourceReader._max_polls` | `int(source_block_seconds / 0.002)` — poll budget per tick |
+| `_SourceReader.run()` | Non-blocking 2ms-poll loop; underflow pushes silence frame; `_underflow_ticks` counter |
+| `_SourceReader._is_mic` | True for MicReader; enables per-second L/R channel analysis |
+| `_SourceReader._mic_ch_mode` | `"average"` / `"left"` / `"right"` — updated every second from rms+corr |
+| `_AudioWriter._MAX_HOLD` | `= 1` — hold last frame at most 1 tick before writing silence |
+| `_AudioWriter._lb_hold / _mic_hold` | Underrun counters; reset on `ok` frame; silence after MAX_HOLD |
+| `_AudioWriter.run()` | `next_tick = time.monotonic() + block_seconds` (startup head-start) |
+| `CaptureEngine._lb_buf / _mic_buf` | `_JitterBuffer(maxlen=4, ...)` |
+| `CaptureEngine.start()` | Resets buffers to fresh `_JitterBuffer` on each call |
+| `DeviceManager.get_fresh_usb_mic_name_if_missing()` | New — spawns temporary PA instance, returns missing USB/headset mic name |
+| `_try_reconnect_streams()` | USB reinit only when `get_fresh_usb_mic_name_if_missing` confirms mismatch |
+
+### New log lines
+
+```
+REC → source underflow | source=MicReader/LoopbackReader | unavailable_ticks=N
+REC → get_read_available unsupported; using blocking read fallback | source=...
+REC → mic channel mode | mode=left/right/average | L_rms=... | R_rms=... | corr=...
+REC → source underrun | source=loopback/mic | hold_ticks=N
+REC → fresh-vs-live PA mismatch | fresh sees mic not in live list | device=...
+REC → USB replug confirmed via PA mismatch | device=... | forcing PyAudio reinit
+REC → fresh PA also sees no new mic | mic stays offline
+```
+
+---
+
 ## 2026-05-08 — Source pacing, latest-frame anti-echo, real-mic selection
 
 ### Root causes fixed

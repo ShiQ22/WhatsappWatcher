@@ -8,30 +8,44 @@ backward-compat properties that return `None` / `False` so existing callers
 don't crash. All recording goes through `CaptureEngine` (PyAudio loopback +
 microphone).
 
-## Audio pipeline architecture (current — 2026-05-08 rev2)
+## Audio pipeline architecture (current — 2026-05-08 rev3)
 
-Three independent daemon threads inside `CaptureEngine`. `_record_loop` is
-**removed**.
+Three independent daemon threads inside `CaptureEngine`. `_record_loop` is **removed**.
 
-- **LoopbackReader** (`_SourceReader`): owns blocking `loopback.read()`. Paced to
-  20ms/chunk; does not flood `_FrameBuffer` when read returns immediately.
-- **MicReader** (`_SourceReader`): owns blocking `mic.read()`. Same pacing.
-- **Writer** (`_AudioWriter`): wall-clock scheduled (`next_tick += block_seconds`).
-  Pulls with `_FrameBuffer.pop_latest_or_silence()` — newest frame only, discards stale.
-  Applies `loopback_gain=0.65`, `mic_gain=0.75`. Int32 mix, int16 clamp.
-  Uses `writeframesraw()` for WAV and debug stems.
-- **`_FrameBuffer`**: thread-safe; replaces raw `deque`. `push()` drops oldest on overflow
-  (logs `[REC-014]`). `pop_latest_or_silence()` discards all but newest frame.
-- Level log every 4s: mic_rms, loopback_rms, mixed_rms, clipped, online state.
+- **LoopbackReader / MicReader** (`_SourceReader`): **non-blocking poll loop** — check
+  `get_read_available()` every 2ms up to one full chunk budget (20ms). If frames available,
+  read immediately. If budget exhausted, push silence frame + pace + continue. Falls back to
+  blocking read if `get_read_available` unsupported (`_get_avail_unsupported` flag).
+- **MicReader**: per-second L/R channel analysis → `_mic_ch_mode` (`left`/`right`/`average`).
+  Chooses stronger channel when one is 4× the other (L_rms/R_rms ratio < 0.25); averages
+  when both similar and corr ≥ 0.5; else uses stronger. Mode logged on change.
+- **Writer** (`_AudioWriter`): wall-clock scheduled (`next_tick += block_seconds`). Startup:
+  `next_tick = time.monotonic() + block_seconds` (one tick head-start). Pulls via
+  `_JitterBuffer.pop_or_hold()` — FIFO oldest-first, holds last-good frame up to MAX_HOLD=1
+  tick on underrun, then silence. Applies `loopback_gain=0.65`, `mic_gain=0.75`.
+  Int32 mix, int16 clamp. `writeframesraw()` for WAV and debug stems.
+- **`_JitterBuffer`**: replaces `_FrameBuffer`. FIFO, maxlen=4. `push()` drops oldest on
+  overflow (logs `[REC-014]`). `pop_or_hold(online, last_frame, silence)` — ok/hold/offline.
+- Level log every 4s: mic_rms, loopback_rms, mixed_rms, clipped, online states.
 - `_record_thread` points to writer for watchdog/`is_active` compatibility.
 
-**Reader pacing fix (2026-05-08 rev2)**: readers now `stop_event.wait(source_block_s - elapsed)`
-after each push, preventing queue flooding when `stream.read()` returns faster than real-time.
-This eliminates repeated `[REC-014]` and writer starvation.
+**Non-blocking reader fix (2026-05-08 rev3)**: eliminated 50% duty-cycle audio islands.
+Root cause: `stream.read()` took exactly 20ms → sleep_for = 0 → immediate re-read → WASAPI
+ring buffer just drained → 20ms block → alternating real/silence frames (92-93% of active
+audio runs ≤ 40ms). Fix: 2ms-poll loop; underflow pushes silence (not skip).
 
-**Latest-frame anti-echo fix (2026-05-08 rev2)**: FIFO `popleft()` caused stale-frame
-echo at call start and after reconnect bursts. `pop_latest_or_silence()` always returns
-the most recent available frame.
+**_JitterBuffer fix (2026-05-08 rev3)**: replaced `pop_latest_or_silence()` (discard-all-but-newest)
+with FIFO + hold-last. Pop-latest discarded valid frames when reader was slightly late, causing
+the same duty-cycle hole. FIFO maintains continuity; MAX_HOLD=1 prefers silence over stale audio.
+
+**Mic channel mode fix (2026-05-08 rev3)**: USB mono mics often expose only one active channel.
+Per-second L/R analysis picks the live channel instead of halving amplitude by averaging.
+
+**Evidence-based USB reinit (2026-05-08 rev3)**: `get_fresh_usb_mic_name_if_missing(live_names)`
+spawns temporary PA instance, confirms mismatch before forcing reinit. No unnecessary teardown.
+
+**Writer startup head-start (2026-05-08 rev3)**: one tick buffer before first pop prevents
+silent first tick when readers haven't produced their first frame yet.
 
 **Loopback-as-mic prevention (2026-05-08 rev2)**: `select_best_mic_device()` uses
 `list_real_mic_devices()` which filters out `[loopback]` devices. Loopback enumeration

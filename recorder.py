@@ -231,6 +231,53 @@ class DeviceManager:
             )
             return best
 
+    def get_fresh_usb_mic_name_if_missing(self, live_names: Set[str]) -> Optional[str]:
+        """
+        Spin up a temporary fresh PyAudio instance and enumerate input devices.
+        Return the name of the first USB/headset real mic that is visible in the
+        fresh instance but absent from live_names, or None.
+        Also returns the first non-loopback real mic if no USB/headset is found
+        but any real mic is missing from the live list (built-in fallback case).
+        Logs the mismatch if found.
+        """
+        try:
+            pa_fresh = pyaudio.PyAudio()
+            count = pa_fresh.get_device_count()
+            usb_result: Optional[str] = None
+            any_result: Optional[str] = None
+            for i in range(count):
+                try:
+                    d = pa_fresh.get_device_info_by_index(i)
+                    if int(d.get("maxInputChannels", 0)) <= 0:
+                        continue
+                    name = str(d.get("name", ""))
+                    if _is_loopback_device_name(name):
+                        continue
+                    if name in live_names:
+                        continue
+                    # Found a real mic not visible in live DeviceManager
+                    name_lower = name.lower()
+                    if usb_result is None and (
+                        "usb" in name_lower
+                        or any(kw in name_lower for kw in self.HEADSET_KEYWORDS)
+                    ):
+                        usb_result = name
+                    if any_result is None:
+                        any_result = name
+                except Exception:
+                    continue
+            pa_fresh.terminate()
+            result = usb_result or any_result
+            if result:
+                log.info(
+                    "REC → fresh-vs-live PA mismatch | fresh sees mic not in live list"
+                    " | device=%s", result,
+                )
+            return result
+        except Exception:
+            log.exception("REC → fresh PA snapshot failed")
+            return None
+
     def register_change_callback(self, callback: Callable[[], None]) -> None:
         """Register a callback fired whenever the device topology changes."""
         with self._lock:
@@ -419,28 +466,35 @@ def _is_loopback_device_name(name: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _FrameBuffer — thread-safe single-slot audio frame store.
+# _JitterBuffer — small FIFO audio frame queue for one source.
 #
-# Holds up to maxlen frames.  push() drops the oldest on overflow (throttled
-# REC-014 log).  pop_latest_or_silence() returns the NEWEST available frame
-# and discards all older ones — the writer never plays stale/delayed audio.
-# If the buffer is empty, pop_latest_or_silence() returns the caller-supplied
-# silence frame.
+# push():  if full, drop OLDEST and log throttled (REC-014).  The oldest frame
+#          is staler than the newest so it is the right one to discard.
+#
+# pop_or_hold():  returns (frame, status) where status is one of:
+#   'ok'      — real frame dequeued FIFO (oldest first)
+#   'hold'    — buffer empty but source is online; caller gets last_frame back
+#   'offline' — source is offline; caller gets silence
+#
+# Buffer depth of 4 frames = 80 ms at 20 ms/chunk.  This absorbs GIL jitter
+# without adding perceptible latency on a phone call.
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _FrameBuffer:
+class _JitterBuffer:
 
     _DROP_LOG_THROTTLE = 1.0
 
     def __init__(self, maxlen: int, source_name: str) -> None:
         self._lock = threading.Lock()
-        self._buf: collections.deque = collections.deque(maxlen=maxlen)
+        self._buf: collections.deque = collections.deque()
+        self._maxlen = maxlen
         self._name = source_name
         self._last_drop_log: float = 0.0
 
     def push(self, frame: bytes) -> None:
         with self._lock:
-            if len(self._buf) >= (self._buf.maxlen or 0):
+            if len(self._buf) >= self._maxlen:
+                self._buf.popleft()  # drop oldest to make room
                 now = time.monotonic()
                 if now - self._last_drop_log >= self._DROP_LOG_THROTTLE:
                     log.warning(
@@ -450,16 +504,19 @@ class _FrameBuffer:
                     self._last_drop_log = now
             self._buf.append(frame)
 
-    def pop_latest_or_silence(self, silence: bytes) -> "tuple[bytes, int]":
-        """Return (newest_frame, n_older_discarded). Clears all older frames."""
+    def pop_or_hold(
+        self,
+        source_online: bool,
+        last_frame: bytes,
+        silence: bytes,
+    ) -> "tuple[bytes, str]":
+        """FIFO pop with hold-last and offline-silence fallbacks."""
         with self._lock:
-            n = len(self._buf)
-            if n == 0:
-                return silence, 0
-            frame = self._buf[-1]
-            dropped = n - 1
-            self._buf.clear()
-            return frame, dropped
+            if self._buf:
+                return self._buf.popleft(), "ok"
+        if source_online:
+            return last_frame, "hold"
+        return silence, "offline"
 
     def clear(self) -> None:
         with self._lock:
@@ -471,21 +528,30 @@ class _FrameBuffer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _SourceReader — owns the blocking stream.read() for ONE audio source.
+# _SourceReader — owns the timed non-blocking read for ONE audio source.
 #
-# Runs in its own daemon thread.  Reads one chunk, validates byte count,
-# downmixes stereo→mono, resamples to mix_rate, normalises to exact
-# chunk_bytes, then pushes to a _FrameBuffer shared with _AudioWriter.
+# Runs in its own daemon thread.  Each source tick (= one chunk period):
+#   1. Poll stream.get_read_available() every 2 ms up to the full chunk budget.
+#   2. If frames available: read chunk_size frames immediately (no blocking).
+#   3. If still unavailable after budget: push explicit silence for that tick
+#      and increment underflow counter (logged throttled).
+#   4. Downmix stereo→mono (MicReader uses channel-mode selection; LoopbackReader
+#      uses simple average).  Resample if source rate ≠ mix rate.
+#   5. Push one normalised mono frame to _JitterBuffer every tick.
 #
-# Paced to one chunk per source_block_seconds so it never floods the buffer
-# when stream.read() returns faster than real-time.
+# If get_read_available() is unsupported, falls back to a single blocking read.
+# Blocking reads that exceed 100 ms repeatedly mark the source offline so the
+# writer fills silence until the reconnect path restores the stream.
 #
 # Never writes WAV files.  Only the _AudioWriter does that.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _SourceReader(threading.Thread):
 
-    _PACE_LAG_LOG_THROTTLE = 1.0  # minimum seconds between pace-lag log lines
+    _UNDERFLOW_LOG_THROTTLE = 4.0   # seconds between underflow log lines
+    _POLL_INTERVAL_S        = 0.002  # 2 ms per get_read_available() poll
+    _MAX_BLOCKING_LAG_MS    = 100.0  # ms; blocking reads slower than this count as lag
+    _MAX_CONSECUTIVE_LAG    = 5      # consecutive slow reads before marking offline
 
     def __init__(
         self,
@@ -496,7 +562,7 @@ class _SourceReader(threading.Thread):
         source_channels: int,
         source_rate: int,
         mix_rate: int,
-        frame_buf: "_FrameBuffer",
+        frame_buf: "_JitterBuffer",
     ) -> None:
         super().__init__(name=name, daemon=True)
         self._stop_event = stop_event
@@ -511,13 +577,28 @@ class _SourceReader(threading.Thread):
         self._online: bool = False
         self._chunk_bytes: int = chunk_size * sample_width
         self._block_seconds: float = chunk_size / max(1, mix_rate)
-        # Pacing uses source rate: hardware delivers chunk_size frames per
-        # source_block_seconds regardless of the mix-rate target.
         self._source_block_seconds: float = chunk_size / max(1, source_rate)
-        self._last_pace_lag_log: float = 0.0
-        # Diagnostic throttle timestamps (not used for audio logic)
-        self._diag_avail_log: float = 0.0   # last time we logged get_read_available
-        self._diag_stereo_log: float = 0.0  # last time we logged stereo channel RMS
+        # max polls before declaring underflow for this tick
+        self._max_polls: int = max(1, int(self._source_block_seconds / self._POLL_INTERVAL_S))
+
+        # Non-blocking read state
+        self._get_avail_unsupported: bool = False
+        self._avail_unsupported_logged: bool = False
+        self._consecutive_lag: int = 0   # consecutive slow blocking reads
+        self._underflow_ticks: int = 0
+        self._underflow_log_ts: float = 0.0
+
+        # Whether this reader is the mic (True) vs loopback (False)
+        self._is_mic: bool = (name == "MicReader")
+
+        # Mic channel-mode state (MicReader only)
+        self._mic_ch_mode: str = "average"
+        self._mic_ch_mode_logged: str = ""
+        self._mic_ch_L2: float = 0.0   # running sum of L^2
+        self._mic_ch_R2: float = 0.0
+        self._mic_ch_LR: float = 0.0   # running sum of L*R
+        self._mic_ch_n:  int   = 0     # sample count in window
+        self._mic_ch_window_start: float = 0.0
 
     # ── stream lifecycle ──────────────────────────────────────────────────────
 
@@ -553,6 +634,9 @@ class _SourceReader(threading.Thread):
 
     def run(self) -> None:
         log.info("REC → %s started", self.name)
+        silence_raw = b"\x00" * self._chunk_bytes
+        self._mic_ch_window_start = time.monotonic()
+
         while not self._stop_event.is_set():
             with self._lock:
                 stream = self._stream
@@ -566,20 +650,46 @@ class _SourceReader(threading.Thread):
 
             iter_start = time.monotonic()
 
-            # ── diagnostic: frames available before blocking read ─────────────
-            now_diag = iter_start
-            if now_diag - self._diag_avail_log >= 4.0:
-                try:
-                    avail = stream.get_read_available()
-                    log.info(
-                        "REC-DIAG → %s pre-read | avail_frames=%d | chunk=%d",
-                        self.name, avail, self._chunk_size,
-                    )
-                except Exception:
-                    pass
-                self._diag_avail_log = now_diag
+            # ── non-blocking poll for available frames ────────────────────────
+            raw: Optional[bytes] = None
 
-            # ── blocking read ─────────────────────────────────────────────────
+            if not self._get_avail_unsupported:
+                for _poll in range(self._max_polls):
+                    try:
+                        avail = stream.get_read_available()
+                    except Exception:
+                        if not self._avail_unsupported_logged:
+                            log.info(
+                                "REC → get_read_available unsupported;"
+                                " using blocking read fallback | source=%s",
+                                self.name,
+                            )
+                            self._avail_unsupported_logged = True
+                        self._get_avail_unsupported = True
+                        break
+                    if avail >= self._chunk_size:
+                        break  # enough frames — proceed to read below
+                    if self._stop_event.wait(self._POLL_INTERVAL_S):
+                        return  # stop requested during poll
+                else:
+                    # Poll budget exhausted — push explicit silence for this tick
+                    self._underflow_ticks += 1
+                    now_uf = time.monotonic()
+                    if now_uf - self._underflow_log_ts >= self._UNDERFLOW_LOG_THROTTLE:
+                        log.info(
+                            "REC → source underflow | source=%s | unavailable_ticks=%d",
+                            self.name, self._underflow_ticks,
+                        )
+                        self._underflow_log_ts = now_uf
+                    self._frame_buf.push(silence_raw)
+                    elapsed = time.monotonic() - iter_start
+                    sleep_for = self._source_block_seconds - elapsed
+                    if sleep_for > 0.001:
+                        self._stop_event.wait(sleep_for)
+                    continue  # skip the read entirely
+
+            # ── actual stream read (should return immediately if avail checked) ─
+            read_start = time.monotonic()
             try:
                 raw = stream.read(self._chunk_size, exception_on_overflow=False)
             except OSError:
@@ -599,13 +709,24 @@ class _SourceReader(threading.Thread):
                     self._stream = None
                 continue
 
-            # ── diagnostic: log slow reads ────────────────────────────────────
-            read_ms = (time.monotonic() - iter_start) * 1000
-            if read_ms > 50 and read_ms - self._source_block_seconds * 1000 > 50:
-                log.info(
-                    "REC-DIAG → %s slow read | read_ms=%.1f | chunk=%d | rate=%d",
-                    self.name, read_ms, self._chunk_size, self._source_rate,
-                )
+            # ── blocking-read lag guard (fallback path only) ─────────────────
+            if self._get_avail_unsupported:
+                read_ms = (time.monotonic() - read_start) * 1000
+                if read_ms > self._MAX_BLOCKING_LAG_MS:
+                    self._consecutive_lag += 1
+                    if self._consecutive_lag >= self._MAX_CONSECUTIVE_LAG:
+                        log.warning(
+                            "REC → %s blocking read repeatedly slow"
+                            " (%.0f ms) — marking offline",
+                            self.name, read_ms,
+                        )
+                        with self._lock:
+                            self._online = False
+                            self._stream = None
+                        self._consecutive_lag = 0
+                        continue
+                else:
+                    self._consecutive_lag = 0
 
             # ── validate byte count ───────────────────────────────────────────
             expected = self._chunk_size * src_ch * self._sample_width
@@ -619,33 +740,60 @@ class _SourceReader(threading.Thread):
                 samples = struct.unpack(f"<{len(raw) // 2}h", raw)
                 if len(samples) % 2 != 0:
                     samples = samples[:-1]
-                mono = [
-                    max(-32768, min(32767, (int(samples[i]) + int(samples[i + 1])) // 2))
-                    for i in range(0, len(samples), 2)
-                ]
-                raw = struct.pack(f"<{len(mono)}h", *mono)
 
-                # ── diagnostic: per-channel RMS + correlation (throttled) ─────
-                now_s = time.monotonic()
-                if now_s - self._diag_stereo_log >= 4.0:
-                    L = samples[0::2]
-                    R = samples[1::2]
-                    n = max(1, len(L))
-                    l_rms = math.sqrt(sum(int(v) * int(v) for v in L) / n)
-                    r_rms = math.sqrt(sum(int(v) * int(v) for v in R) / n)
-                    mix_rms = math.sqrt(sum(int(mono[i]) * int(mono[i]) for i in range(len(mono))) / max(1, len(mono)))
-                    # Pearson-like correlation (sign only, unnormalized)
-                    if l_rms > 0 and r_rms > 0:
-                        cov = sum(int(L[i]) * int(R[i]) for i in range(n)) / n
-                        corr = cov / (l_rms * r_rms)
+                if self._is_mic:
+                    # ── mic channel-mode selection ────────────────────────────
+                    L_raw = samples[0::2]
+                    R_raw = samples[1::2]
+                    n_smp = len(L_raw)
+                    self._mic_ch_L2 += sum(int(v) * int(v) for v in L_raw)
+                    self._mic_ch_R2 += sum(int(v) * int(v) for v in R_raw)
+                    self._mic_ch_LR += sum(int(L_raw[i]) * int(R_raw[i]) for i in range(n_smp))
+                    self._mic_ch_n  += n_smp
+
+                    now_mc = time.monotonic()
+                    if now_mc - self._mic_ch_window_start >= 1.0 and self._mic_ch_n > 0:
+                        l_rms = math.sqrt(self._mic_ch_L2 / self._mic_ch_n)
+                        r_rms = math.sqrt(self._mic_ch_R2 / self._mic_ch_n)
+                        cov   = self._mic_ch_LR / self._mic_ch_n
+                        corr  = cov / (l_rms * r_rms) if (l_rms > 0 and r_rms > 0) else 0.0
+                        mx, mn = max(l_rms, r_rms), min(l_rms, r_rms)
+                        if mx > 0 and mn / mx < 0.25:
+                            new_mode = "left" if l_rms >= r_rms else "right"
+                        elif corr >= 0.5:
+                            new_mode = "average"
+                        else:
+                            new_mode = "left" if l_rms >= r_rms else "right"
+                        if new_mode != self._mic_ch_mode_logged:
+                            log.info(
+                                "REC → mic channel mode | mode=%s"
+                                " | L_rms=%.1f | R_rms=%.1f | corr=%.3f",
+                                new_mode, l_rms, r_rms, corr,
+                            )
+                            self._mic_ch_mode_logged = new_mode
+                        self._mic_ch_mode = new_mode
+                        self._mic_ch_L2 = self._mic_ch_R2 = self._mic_ch_LR = 0.0
+                        self._mic_ch_n  = 0
+                        self._mic_ch_window_start = now_mc
+
+                    mode = self._mic_ch_mode
+                    if mode == "left":
+                        mono = [int(samples[i]) for i in range(0, len(samples), 2)]
+                    elif mode == "right":
+                        mono = [int(samples[i + 1]) for i in range(0, len(samples), 2)]
                     else:
-                        corr = 0.0
-                    log.info(
-                        "REC-DIAG → %s stereo | L_rms=%.1f | R_rms=%.1f"
-                        " | mix_rms=%.1f | LR_corr=%.3f",
-                        self.name, l_rms, r_rms, mix_rms, corr,
-                    )
-                    self._diag_stereo_log = now_s
+                        mono = [
+                            max(-32768, min(32767, (int(samples[i]) + int(samples[i + 1])) // 2))
+                            for i in range(0, len(samples), 2)
+                        ]
+                else:
+                    # loopback — simple average
+                    mono = [
+                        max(-32768, min(32767, (int(samples[i]) + int(samples[i + 1])) // 2))
+                        for i in range(0, len(samples), 2)
+                    ]
+
+                raw = struct.pack(f"<{len(mono)}h", *mono)
 
             # ── resample ──────────────────────────────────────────────────────
             if src_rate != self._mix_rate:
@@ -657,25 +805,14 @@ class _SourceReader(threading.Thread):
             elif len(raw) > self._chunk_bytes:
                 raw = raw[:self._chunk_bytes]
 
-            # ── push to frame buffer (overflow logged inside _FrameBuffer) ────
+            # ── push to jitter buffer ─────────────────────────────────────────
             self._frame_buf.push(raw)
 
-            # ── pace to source block duration ─────────────────────────────────
-            # If stream.read() returned faster than real-time (e.g. buffer
-            # pre-filled), sleep the remainder so we don't flood the buffer.
+            # ── pace: sleep any remaining time in this source tick ────────────
             elapsed = time.monotonic() - iter_start
             sleep_for = self._source_block_seconds - elapsed
             if sleep_for > 0.001:
                 self._stop_event.wait(sleep_for)
-            elif elapsed > self._source_block_seconds * 1.5 and elapsed > 0.005:
-                now = time.monotonic()
-                if now - self._last_pace_lag_log >= self._PACE_LAG_LOG_THROTTLE:
-                    log.warning(
-                        "REC → source pace lag | source=%s | behind_ms=%.1f",
-                        self.name,
-                        (elapsed - self._source_block_seconds) * 1000,
-                    )
-                    self._last_pace_lag_log = now
 
         log.info("REC → %s exiting", self.name)
 
@@ -695,11 +832,13 @@ class _AudioWriter(threading.Thread):
     _LEVEL_LOG_INTERVAL = 4.0    # seconds between RMS level log lines
     _SILENCE_RMS_THRESHOLD = 10  # RMS below this counts as silence
 
+    _MAX_HOLD = 1  # frames before hold-last gives up and writes silence
+
     def __init__(
         self,
         stop_event: threading.Event,
-        lb_buf: "_FrameBuffer",
-        mic_buf: "_FrameBuffer",
+        lb_buf: "_JitterBuffer",
+        mic_buf: "_JitterBuffer",
         wav_file: wave.Wave_write,
         chunk_size: int,
         sample_width: int,
@@ -746,9 +885,11 @@ class _AudioWriter(threading.Thread):
         self._silence_buf: bytearray = bytearray()
         self._silent_secs: int = 0
 
-        # Stale-drop throttle (one per source, 1s min between log lines)
-        self._lb_drop_log: float = 0.0
-        self._mic_drop_log: float = 0.0
+        # Hold-last underrun tracking (one per source)
+        self._lb_hold: int = 0
+        self._mic_hold: int = 0
+        self._lb_underrun_log: float = 0.0
+        self._mic_underrun_log: float = 0.0
 
     def run(self) -> None:
         log.info("REC → writer started | mix_rate=%sHz | mic_gain=%.2f | loopback_gain=%.2f",
@@ -757,8 +898,12 @@ class _AudioWriter(threading.Thread):
         block_seconds = self._block_seconds
         count = self._chunk_bytes // 2  # int16 samples per chunk
 
-        next_tick = time.monotonic()
-        self._level_timer = next_tick
+        # Last valid frames (used for hold-last on brief underrun)
+        lb_last  = silence
+        mic_last = silence
+
+        next_tick = time.monotonic() + block_seconds  # give readers one tick head-start
+        self._level_timer = time.monotonic()
 
         try:
             while not self._stop_event.is_set():
@@ -778,32 +923,47 @@ class _AudioWriter(threading.Thread):
                 if self._stop_event.is_set():
                     break
 
-                # ── pull newest frame or silence (discard stale older frames) ─
-                lb_data, lb_dropped = self._lb_buf.pop_latest_or_silence(silence)
-                mic_data, mic_dropped = self._mic_buf.pop_latest_or_silence(silence)
+                lb_online  = self._lb_reader.is_online
+                mic_online = self._mic_reader.is_online
 
-                if lb_dropped:
-                    now2 = time.monotonic()
-                    if now2 - self._lb_drop_log >= 1.0:
-                        log.warning(
-                            "REC → stale frames dropped | source=loopback | dropped=%d",
-                            lb_dropped,
-                        )
-                        self._lb_drop_log = now2
+                # ── FIFO pop with hold-last on brief underrun ─────────────────
+                lb_data,  lb_status  = self._lb_buf.pop_or_hold(lb_online,  lb_last,  silence)
+                mic_data, mic_status = self._mic_buf.pop_or_hold(mic_online, mic_last, silence)
 
-                if mic_dropped:
-                    now2 = time.monotonic()
-                    if now2 - self._mic_drop_log >= 1.0:
-                        log.warning(
-                            "REC → stale frames dropped | source=mic | dropped=%d",
-                            mic_dropped,
-                        )
-                        self._mic_drop_log = now2
+                if lb_status == "ok":
+                    lb_last = lb_data
+                    self._lb_hold = 0
+                elif lb_status == "hold":
+                    self._lb_hold += 1
+                    if self._lb_hold > self._MAX_HOLD:
+                        lb_data = silence  # give up holding — silence is safer
+                        now2 = time.monotonic()
+                        if now2 - self._lb_underrun_log >= 2.0:
+                            log.info(
+                                "REC → source underrun | source=loopback"
+                                " | hold_ticks=%d", self._lb_hold,
+                            )
+                            self._lb_underrun_log = now2
+
+                if mic_status == "ok":
+                    mic_last = mic_data
+                    self._mic_hold = 0
+                elif mic_status == "hold":
+                    self._mic_hold += 1
+                    if self._mic_hold > self._MAX_HOLD:
+                        mic_data = silence
+                        now2 = time.monotonic()
+                        if now2 - self._mic_underrun_log >= 2.0:
+                            log.info(
+                                "REC → source underrun | source=mic"
+                                " | hold_ticks=%d", self._mic_hold,
+                            )
+                            self._mic_underrun_log = now2
 
                 # ── reconnect trigger when either source is offline ───────────
                 if (
                     not self._stop_event.is_set()
-                    and (not self._lb_reader.is_online or not self._mic_reader.is_online)
+                    and (not lb_online or not mic_online)
                     and self._reconnect_fn is not None
                 ):
                     self._reconnect_fn()  # internally throttled to 2s
@@ -1018,10 +1178,13 @@ class CaptureEngine:
         self._loopback_debug_path: Optional[str] = None
 
         # Three-thread capture: LoopbackReader + MicReader + Writer
-        self._lb_buf: _FrameBuffer = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
-        self._mic_buf: _FrameBuffer = _FrameBuffer(maxlen=24, source_name="MicReader")
+        self._lb_buf: _JitterBuffer = _JitterBuffer(maxlen=4, source_name="LoopbackReader")
+        self._mic_buf: _JitterBuffer = _JitterBuffer(maxlen=4, source_name="MicReader")
         self._lb_reader: Optional[_SourceReader] = None
         self._mic_reader: Optional[_SourceReader] = None
+
+        # USB reconnect fail counter — reset each call start
+        self._mic_reconnect_fail_count: int = 0
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -1076,8 +1239,9 @@ class CaptureEngine:
             self._loopback_debug_path = None
             self._lb_reader = None
             self._mic_reader = None
-            self._lb_buf = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
-            self._mic_buf = _FrameBuffer(maxlen=24, source_name="MicReader")
+            self._lb_buf = _JitterBuffer(maxlen=4, source_name="LoopbackReader")
+            self._mic_buf = _JitterBuffer(maxlen=4, source_name="MicReader")
+            self._mic_reconnect_fail_count = 0
 
             # Open WASAPI loopback (captures incoming voice / system audio)
             self._loopback_stream = self._open_loopback_stream()
@@ -1482,30 +1646,68 @@ class CaptureEngine:
                     return
                 device = self._device_manager.select_best_mic_device()
                 if device is None:
-                    log.warning(
-                        "REC → reconnect skipped; source still unavailable"
-                        " — no real mic found, mic stays offline"
+                    self._mic_reconnect_fail_count += 1
+                    log.info(
+                        "REC → no real mic in live PA | fail_count=%d"
+                        " — checking fresh PA snapshot",
+                        self._mic_reconnect_fail_count,
                     )
-                    # Diagnostic: fresh PyAudio snapshot to see if USB returned
-                    try:
-                        _pa_fresh = pyaudio.PyAudio()
-                        _n = _pa_fresh.get_device_count()
-                        log.info("REC-DIAG → fresh PyAudio snapshot | device_count=%d", _n)
-                        for _i in range(_n):
-                            try:
-                                _d = _pa_fresh.get_device_info_by_index(_i)
-                                if int(_d.get("maxInputChannels", 0)) > 0:
-                                    log.info(
-                                        "REC-DIAG → fresh INPUT idx=%d | %s | in=%d | rate=%d",
-                                        _i, _d.get("name", "?"),
-                                        int(_d.get("maxInputChannels", 0)),
-                                        int(_d.get("defaultSampleRate", 0)),
+                    # Evidence-based reinit: only reinit if fresh PA sees a mic
+                    # that the live instance misses (proves USB was replugged).
+                    live_names = {
+                        d["name"]
+                        for d in self._device_manager.list_real_mic_devices()
+                    }
+                    fresh_name = self._device_manager.get_fresh_usb_mic_name_if_missing(
+                        live_names
+                    )
+                    if fresh_name is not None and not self._stop_event.is_set():
+                        log.info(
+                            "REC → USB replug confirmed via PA mismatch | device=%s"
+                            " | forcing PyAudio reinit", fresh_name,
+                        )
+                        # Signal lb_reader offline to unblock any pending read
+                        with self._lock:
+                            lb_reader_ref2 = self._lb_reader
+                            self._loopback_stream = None
+                        if lb_reader_ref2 is not None:
+                            lb_reader_ref2.go_offline()
+
+                        self._device_manager.reinit_pyaudio()
+
+                        if not self._stop_event.is_set():
+                            new_lb2 = self._open_loopback_stream()
+                            if new_lb2 is not None:
+                                with self._lock:
+                                    if not self._stop_event.is_set():
+                                        self._loopback_stream = new_lb2
+                                if not self._stop_event.is_set() and lb_reader_ref2 is not None:
+                                    lb_reader_ref2.set_stream(
+                                        new_lb2,
+                                        self._loopback_channels,
+                                        self._loopback_rate,
                                     )
-                            except Exception:
-                                pass
-                        _pa_fresh.terminate()
-                    except Exception:
-                        log.exception("REC-DIAG → fresh PyAudio snapshot failed")
+                                    log.info("REC → loopback reinjected after USB-replug reinit")
+                                else:
+                                    try:
+                                        new_lb2.stop_stream()
+                                        new_lb2.close()
+                                    except Exception:
+                                        pass
+
+                            if not self._stop_event.is_set():
+                                device = self._device_manager.select_best_mic_device()
+                                if device is None:
+                                    log.warning(
+                                        "REC → reconnect skipped; no real mic even after"
+                                        " reinit — mic stays offline"
+                                    )
+                    else:
+                        log.info(
+                            "REC → fresh PA also sees no new mic | mic stays offline"
+                        )
+                if device is None:
+                    pass  # mic stays offline — fall through
                 else:
                     dev_name = str(device.get("name", "?"))
                     with self._lock:
