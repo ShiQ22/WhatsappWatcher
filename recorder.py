@@ -949,32 +949,6 @@ class CaptureEngine:
                                 self._sample_rate, rate,
                             )
 
-                        # 0.5-second probe read — diagnose silent mic without blocking recording
-                        try:
-                            probe_frames = min(int(self._actual_sample_rate * 0.5),
-                                               self._chunk_size * 4)
-                            probe_data = stream.read(probe_frames, exception_on_overflow=False)
-                            probe_samples = struct.unpack(f"<{len(probe_data) // 2}h", probe_data)
-                            probe_rms = (
-                                math.sqrt(sum(s * s for s in probe_samples) / len(probe_samples))
-                                if probe_samples else 0.0
-                            )
-                            if probe_rms < 1.0:
-                                log.warning(
-                                    "REC → mic probe silent | rms=%.1f | channels=%s | device=%s | "
-                                    "possible causes: mic volume=0, no physical mic, or exclusive-mode conflict",
-                                    probe_rms, ch, device_name,
-                                )
-                            else:
-                                log.info(
-                                    "REC → mic probe OK | rms=%.1f | channels=%s | device=%s",
-                                    probe_rms, ch, device_name,
-                                )
-                        except Exception:
-                            log.exception(
-                                "[REC-002] Mic probe read failed | device=%s", device_name
-                            )
-
                         return True
 
                     except OSError as exc:
@@ -1178,8 +1152,12 @@ class CaptureEngine:
     def _record_loop(self) -> None:
         log.info("REC → record thread started | device=%s | file=%s",
                  self._device_name, self._output_path)
+        # Computed once — constant for the lifetime of this recording session.
+        _chunk_bytes = self._chunk_size * self._sample_width
+        _block_seconds = self._chunk_size / max(1, self._mix_rate)
         try:
             while not self._stop_event.is_set():
+                _iter_start = time.monotonic()
                 try:
                     loopback_data: Optional[bytes] = None
                     mic_data: Optional[bytes] = None
@@ -1192,6 +1170,22 @@ class CaptureEngine:
                                 self._chunk_size,
                                 exception_on_overflow=False,
                             )
+                            # Validate pre-downmix byte count
+                            _lb_expected = (
+                                self._chunk_size * self._loopback_channels * self._sample_width
+                            )
+                            if len(raw) < _lb_expected:
+                                log.warning(
+                                    "REC → loopback read short | got=%d expected=%d | padding",
+                                    len(raw), _lb_expected,
+                                )
+                                raw = raw + b"\x00" * (_lb_expected - len(raw))
+                            elif len(raw) > _lb_expected:
+                                log.warning(
+                                    "REC → loopback read long | got=%d expected=%d | trimming",
+                                    len(raw), _lb_expected,
+                                )
+                                raw = raw[:_lb_expected]
                             if self._loopback_channels == 2:
                                 samples = struct.unpack(f"<{len(raw)//2}h", raw)
                                 if len(samples) % 2 != 0:
@@ -1210,6 +1204,13 @@ class CaptureEngine:
                                     self._loopback_rate,
                                     self._mix_rate,
                                 )
+                            # Normalize to exact output chunk size (handles resample rounding)
+                            if len(loopback_data) < _chunk_bytes:
+                                loopback_data = loopback_data + b"\x00" * (
+                                    _chunk_bytes - len(loopback_data)
+                                )
+                            elif len(loopback_data) > _chunk_bytes:
+                                loopback_data = loopback_data[:_chunk_bytes]
                         except OSError as exc:
                             if self._stop_event.is_set():
                                 break
@@ -1271,6 +1272,11 @@ class CaptureEngine:
                                     raw = self._resample(
                                         raw, self._actual_sample_rate, self._mix_rate
                                     )
+                                # Normalize to exact output chunk size (handles resample rounding)
+                                if len(raw) < _chunk_bytes:
+                                    raw = raw + b"\x00" * (_chunk_bytes - len(raw))
+                                elif len(raw) > _chunk_bytes:
+                                    raw = raw[:_chunk_bytes]
                                 mic_data = raw
                         except OSError as exc:
                             if self._stop_event.is_set():
@@ -1291,15 +1297,14 @@ class CaptureEngine:
                             self._stream = None
 
                     # ── Debug stems ───────────────────────────────────────────
-                    # Write post-downmix mono frames (or silence) to per-stem files.
-                    # Done before normalization so stems reflect actual captured data.
+                    # Sources are normalized to exactly _chunk_bytes above.
+                    # Write the normalized mono frames (or silence) per stem.
                     if self._debug_stems:
-                        _stem_bytes = self._chunk_size * self._sample_width
                         if self._loopback_debug_wav is not None:
                             try:
                                 self._loopback_debug_wav.writeframes(
                                     loopback_data if loopback_data is not None
-                                    else b"\x00" * _stem_bytes
+                                    else b"\x00" * _chunk_bytes
                                 )
                             except Exception:
                                 pass
@@ -1307,7 +1312,7 @@ class CaptureEngine:
                             try:
                                 self._mic_debug_wav.writeframes(
                                     mic_data if mic_data is not None
-                                    else b"\x00" * _stem_bytes
+                                    else b"\x00" * _chunk_bytes
                                 )
                             except Exception:
                                 pass
@@ -1315,7 +1320,6 @@ class CaptureEngine:
                     # ── Normalize: fill missing source with silence ───────────
                     # Every iteration writes exactly one mono chunk so the WAV
                     # grows at wall-clock rate regardless of which streams are live.
-                    _chunk_bytes = self._chunk_size * self._sample_width
                     if loopback_data is None:
                         loopback_data = b"\x00" * _chunk_bytes
                     if mic_data is None:
@@ -1367,12 +1371,24 @@ class CaptureEngine:
                             self._silent_secs = 0
                         self._silence_buffer = bytearray()
 
-                    # ── Pace the loop when no live streams ────────────────────
-                    # Prevents CPU spin while waiting for USB reconnect.
-                    # Must come after the WAV write so silence is committed first.
+                    # ── Writer clock ──────────────────────────────────────────
+                    # Pace each tick to wall-clock rate so the WAV duration
+                    # matches real time regardless of which sources are live.
+                    # When loopback is active its blocking read consumes most of
+                    # _block_seconds; the wait here covers any remaining gap.
+                    # When both streams are gone, the wait IS the pacing.
                     if lb_stream is None and mic_stream is None:
                         self._try_reconnect_streams_async()
-                        time.sleep(max(0.005, self._chunk_size / max(1, self._mix_rate)))
+                    _elapsed = time.monotonic() - _iter_start
+                    _sleep = _block_seconds - _elapsed
+                    if _sleep > 0:
+                        if self._stop_event.wait(_sleep):
+                            break
+                    elif (_elapsed - _block_seconds) * 1000 > 10:
+                        log.warning(
+                            "[REC-013] writer lag | behind_ms=%.1f",
+                            (_elapsed - _block_seconds) * 1000,
+                        )
 
                 except Exception:
                     if self._stop_event.is_set():
