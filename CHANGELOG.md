@@ -1,5 +1,74 @@
 # Changelog
 
+## 2026-05-08 — Source pacing, latest-frame anti-echo, real-mic selection
+
+### Root causes fixed
+
+1. **Reader flooding (REC-014 / REC-013):** `_SourceReader.run()` had no sleep after
+   a successful read.  On WASAPI-buffered devices `stream.read()` can return in <1 ms,
+   causing tight-loop flooding of `_FrameBuffer` and writer starvation.
+   Fix: `iter_start` before read; `stop_event.wait(source_block_seconds - elapsed)` after
+   push.  Readers now produce at most one frame per 20 ms.
+
+2. **Echo / delayed voice:** `_AudioWriter` used `popleft()` (FIFO).  When the buffer
+   had N stale frames the writer mixed 0–N×20 ms old audio, causing audible echo at
+   call start and after reconnect bursts.
+   Fix: `_FrameBuffer.pop_latest_or_silence()` discards all but the newest frame.
+
+3. **Loopback-as-mic:** `select_best_device()` ranked `Speakers [Loopback]` above
+   built-in mic when USB headset was removed (loopback gets `+3` USB score).
+   Fix: `select_best_mic_device()` uses `list_real_mic_devices()` which filters out
+   any device whose name contains `[loopback]`.
+
+4. **Reconnect/stop race:** reconnect thread could open a new stream after `stop()`
+   started, leaking a stream handle.
+   Fix: `_reconnect_disabled = True` set under lock in `stop()` before
+   `stop_event.set()`; all reconnect entry points return immediately if disabled.
+
+### Changes
+
+| Symbol | Change |
+|--------|--------|
+| `_is_loopback_device_name(name)` | New module-level helper — `"[loopback]" in name.lower()` |
+| `_FrameBuffer` | New thread-safe frame store; replaces raw `deque` in readers + writer |
+| `_SourceReader.__init__` | `frame_buf: _FrameBuffer` replaces `queue: deque`; `_source_block_seconds` added |
+| `_SourceReader.run()` | Pacing: `wait(source_block_seconds - elapsed)`; throttled pace-lag log |
+| `_AudioWriter.__init__` | `lb_buf/mic_buf: _FrameBuffer` replaces raw deques |
+| `_AudioWriter.run()` | `pop_latest_or_silence()`; throttled stale-drop log; `writeframesraw()` |
+| `DeviceManager.list_real_mic_devices()` | New — filters loopback from input list |
+| `DeviceManager.select_best_mic_device()` | New — uses `list_real_mic_devices()`; never returns loopback |
+| `CaptureEngine.__init__` | `_lb_buf/_mic_buf: _FrameBuffer`; `_reconnect_disabled: bool` |
+| `CaptureEngine.start()` | Resets `_reconnect_disabled`; passes `frame_buf=` to readers |
+| `CaptureEngine.stop()` | Sets `_reconnect_disabled = True` under lock before `stop_event.set()` |
+| `_try_reconnect_streams_async()` | Returns immediately if `_reconnect_disabled or stop_event` |
+| `_try_reconnect_streams()` | Uses `select_best_mic_device()`; post-open stop-race close; new logs |
+| `Recorder.start_recording()` | Uses `select_best_mic_device()`; None device → loopback-only start |
+| `Recorder.ensure_recording_alive()` | Uses `select_best_mic_device()` |
+
+### Mic selection behaviour
+
+| Situation | Result |
+|-----------|--------|
+| USB/headset present | USB/headset mic selected (high score) |
+| USB absent, built-in exists | Built-in mic used as fallback; logs `REC → using built-in microphone fallback` |
+| No real mic | `None` returned; recording starts loopback-only; logs no-mic warning |
+| Reconnect USB mid-call | `REC → USB/headset mic restored` |
+| Loopback device | Always excluded from mic candidates |
+
+### New log lines
+
+```
+REC → excluding loopback device from mic candidates | name=...
+REC → no real microphone available — mic source will be silence until reconnect
+REC → using built-in microphone fallback | device=...
+REC → USB/headset mic restored | device=...
+REC → stale frames dropped | source=loopback/mic | dropped=N
+REC → source pace lag | source=MicReader/LoopbackReader | behind_ms=...
+REC → reconnect skipped; source still unavailable — no real mic found, mic stays offline
+```
+
+---
+
 ## 2026-05-08 — Three-thread audio pipeline refactor
 
 ### Root cause fixed

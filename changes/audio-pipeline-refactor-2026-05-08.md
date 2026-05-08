@@ -64,6 +64,40 @@ Writer death → `_trigger_recovery()` → `_stop_readers()` + `recovery_exhaust
 `Recorder.ensure_recording_alive()` detects `is_active == False` and creates a new segment.
 The WAV finalized by the writer's `finally` block is kept as a valid (if short) recording.
 
+## Follow-up fixes (2026-05-08 rev2)
+
+### Problems addressed
+
+1. **REC-014 flooding / writer starvation** — readers tight-looped when `stream.read()`
+   returned immediately (WASAPI buffer pre-filled).  Fixed by pacing each reader:
+   `stop_event.wait(source_block_seconds - elapsed)` after every successful push.
+
+2. **Echo / delayed audio** — FIFO `popleft()` caused the writer to mix stale frames
+   accumulated during a read burst.  Fixed by replacing raw deques with `_FrameBuffer`
+   whose `pop_latest_or_silence()` always returns the newest frame and discards older ones.
+
+3. **Loopback-as-mic** — `select_best_device()` could return `Speakers [Loopback]` as
+   the mic device when USB was disconnected (USB score bonus).  Fixed by adding
+   `select_best_mic_device()` which uses `list_real_mic_devices()` filtering `[loopback]`.
+
+4. **Reconnect/stop race** — reconnect thread could open a stream after `stop()` began.
+   Fixed by `_reconnect_disabled` flag set under lock in `stop()`.
+
+### New symbols
+
+| Symbol | Purpose |
+|--------|---------|
+| `_is_loopback_device_name(name)` | `"[loopback]" in name.lower()` |
+| `_FrameBuffer` | Thread-safe frame store: `push()` + `pop_latest_or_silence()` + `clear()` |
+| `DeviceManager.list_real_mic_devices()` | Mic candidates without loopback devices |
+| `DeviceManager.select_best_mic_device()` | Highest-score real mic or `None` |
+| `CaptureEngine._reconnect_disabled` | Set `True` by `stop()`, checked by reconnect paths |
+
+### writeframesraw
+
+`_AudioWriter` now uses `writeframesraw()` for both the main WAV and debug stems.
+`wave.close()` writes the final frame-count header.  Saves a disk seek per 20 ms chunk.
+
 ## Config additions
 
 `config.json` and `config.py` DEFAULT_CONFIG both now have:

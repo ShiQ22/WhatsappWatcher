@@ -8,24 +8,40 @@ backward-compat properties that return `None` / `False` so existing callers
 don't crash. All recording goes through `CaptureEngine` (PyAudio loopback +
 microphone).
 
-## Audio pipeline architecture (current — 2026-05-08)
+## Audio pipeline architecture (current — 2026-05-08 rev2)
 
 Three independent daemon threads inside `CaptureEngine`. `_record_loop` is
 **removed**.
 
-- **LoopbackReader** (`_SourceReader`): owns blocking `loopback.read()`. On WASAPI
-  stall it blocks in its own thread; the writer is unaffected.
-- **MicReader** (`_SourceReader`): owns blocking `mic.read()`.
+- **LoopbackReader** (`_SourceReader`): owns blocking `loopback.read()`. Paced to
+  20ms/chunk; does not flood `_FrameBuffer` when read returns immediately.
+- **MicReader** (`_SourceReader`): owns blocking `mic.read()`. Same pacing.
 - **Writer** (`_AudioWriter`): wall-clock scheduled (`next_tick += block_seconds`).
-  Pulls from `deque(maxlen=24)` queues or silence. Applies `loopback_gain=0.65`
-  and `mic_gain=0.75`. Int32 mix, int16 clamp. Never calls `stream.read()`.
-- Queues: 24 frames × 20ms = ~480ms buffer. Overflow drops oldest, logs `[REC-014]`.
+  Pulls with `_FrameBuffer.pop_latest_or_silence()` — newest frame only, discards stale.
+  Applies `loopback_gain=0.65`, `mic_gain=0.75`. Int32 mix, int16 clamp.
+  Uses `writeframesraw()` for WAV and debug stems.
+- **`_FrameBuffer`**: thread-safe; replaces raw `deque`. `push()` drops oldest on overflow
+  (logs `[REC-014]`). `pop_latest_or_silence()` discards all but newest frame.
 - Level log every 4s: mic_rms, loopback_rms, mixed_rms, clipped, online state.
 - `_record_thread` points to writer for watchdog/`is_active` compatibility.
 
-**Root cause this fixed**: WAV ratio=0.63 on 19s call, `behind_ms=2090`.
-WASAPI loopback stall blocked the single `_record_loop` thread for 2 seconds;
-writer clock measured elapsed AFTER the blocking read and could not compensate.
+**Reader pacing fix (2026-05-08 rev2)**: readers now `stop_event.wait(source_block_s - elapsed)`
+after each push, preventing queue flooding when `stream.read()` returns faster than real-time.
+This eliminates repeated `[REC-014]` and writer starvation.
+
+**Latest-frame anti-echo fix (2026-05-08 rev2)**: FIFO `popleft()` caused stale-frame
+echo at call start and after reconnect bursts. `pop_latest_or_silence()` always returns
+the most recent available frame.
+
+**Loopback-as-mic prevention (2026-05-08 rev2)**: `select_best_mic_device()` uses
+`list_real_mic_devices()` which filters out `[loopback]` devices. Loopback enumeration
+remains in `_open_loopback_stream()` only. Mic selection cases:
+- USB/headset: preferred (USB+headset score bonus)
+- Built-in fallback: allowed when no USB/headset
+- No real mic: `None` returned → loopback-only recording, mic stays offline
+
+**Reconnect/stop race fix (2026-05-08 rev2)**: `_reconnect_disabled = True` set under
+lock in `stop()` before `stop_event.set()`. All reconnect paths return immediately if disabled.
 
 ## Audio fix history (pre-three-thread)
 

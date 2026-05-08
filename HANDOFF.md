@@ -13,22 +13,41 @@ launcher.py
         └── uploader.py      → copies recording files to network share
 ```
 
-### recorder.py internal architecture (as of 2026-05-08)
+### recorder.py internal architecture (as of 2026-05-08 rev2)
 
 Three independent daemon threads inside `CaptureEngine`:
 
 ```
-LoopbackReader (_SourceReader) ──── lb_queue (deque maxlen=24) ────┐
-                                                                    ├─► _AudioWriter
-MicReader      (_SourceReader) ──── mic_queue (deque maxlen=24) ───┘    (wall-clock WAV writes)
+LoopbackReader (_SourceReader) ──── _lb_buf (_FrameBuffer) ────┐
+                                                                ├─► _AudioWriter
+MicReader      (_SourceReader) ──── _mic_buf (_FrameBuffer) ───┘    (wall-clock WAV writes)
 ```
 
 - Reader threads own blocking `stream.read()`. Writer never calls `stream.read()`.
-- Writer uses absolute `next_tick += block_seconds` scheduling (no drift).
+- Each reader is **paced**: `stop_event.wait(source_block_seconds - elapsed)` after every push.
+  Prevents queue flooding when `stream.read()` returns faster than real-time.
+- Writer pulls with `pop_latest_or_silence()` — **newest frame**, discards stale ones.
+  Prevents delayed/echo audio from queue backlog.
 - Gain mixing: `int(lb * loopback_gain + mic * mic_gain)`, clamped int16.
+- WAV written with `writeframesraw()`; `wave.close()` finalises header.
 - On USB disconnect: `reader.go_offline()` unblocks blocking reads, writer fills silence.
 - On reconnect: `reader.set_stream(new_stream, ...)` injects new stream into running reader.
 - `_record_thread` points to the writer thread (watchdog compatibility).
+- `_reconnect_disabled` set `True` by `stop()` under lock before `stop_event.set()`.
+  Prevents reconnect thread from opening streams during finalization.
+
+### Mic device selection
+
+`DeviceManager.select_best_mic_device()` uses `list_real_mic_devices()` which filters
+out any device whose name contains `[loopback]`. The three mic cases:
+
+| Case | Behaviour |
+|------|-----------|
+| USB/headset present | USB mic selected (highest score) |
+| USB absent, built-in exists | Built-in used as fallback (`REC → using built-in microphone fallback`) |
+| No real mic at all | `None` returned → loopback-only recording; mic reader starts offline |
+
+Loopback selection is separate inside `_open_loopback_stream()` — never affects mic.
 
 ### Poll loop flow (main.py `run()`)
 

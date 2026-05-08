@@ -180,6 +180,57 @@ class DeviceManager:
             )
             return best
 
+    def list_real_mic_devices(self) -> List[Dict[str, Any]]:
+        """
+        Like list_input_devices() but excludes WASAPI [Loopback] entries.
+        Use this for mic selection. Loopback discovery stays in _open_loopback_stream().
+        """
+        devices = self.list_input_devices()
+        real: List[Dict[str, Any]] = []
+        for dev in devices:
+            name = dev.get("name", "")
+            if _is_loopback_device_name(name):
+                log.info(
+                    "REC → excluding loopback device from mic candidates | name=%s", name
+                )
+                continue
+            real.append(dev)
+        return real
+
+    def select_best_mic_device(self) -> Optional[Dict[str, Any]]:
+        """
+        Select the highest-scoring *real* microphone.
+        Returns None when no real mic exists (caller handles loopback-only mode).
+        Never returns a [Loopback] device.
+
+        Priority (descending):
+          USB/headset comm-default > USB headset > headset > built-in (valid fallback)
+        """
+        with self._lock:
+            devices = self.list_real_mic_devices()
+            if not devices:
+                return None
+
+            comm_idx = self.get_default_comm_device_index()
+            for dev in devices:
+                is_comm = (comm_idx is not None and dev["index"] == comm_idx)
+                dev["is_comm_default"] = is_comm
+                dev["score"] = self.score_device(
+                    dev["name"], dev["host_api_name"], is_comm
+                )
+
+            devices.sort(
+                key=lambda d: (d["score"], 1 if d.get("is_comm_default") else 0),
+                reverse=True,
+            )
+            best = devices[0]
+            self._last_comm_index = comm_idx if comm_idx is not None else -1
+            log.info(
+                "REC → real mic selected | device=%s | score=%s | api=%s | index=%s",
+                best["name"], best["score"], best["host_api_name"] or "?", best["index"],
+            )
+            return best
+
     def register_change_callback(self, callback: Callable[[], None]) -> None:
         """Register a callback fired whenever the device topology changes."""
         with self._lock:
@@ -362,19 +413,79 @@ def _resample_audio(data: bytes, from_rate: int, to_rate: int) -> bytes:
     return struct.pack(f"<{new_len}h", *resampled)
 
 
+def _is_loopback_device_name(name: str) -> bool:
+    """True when this device is a WASAPI loopback capture — never a real mic."""
+    return "[loopback]" in (name or "").lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _FrameBuffer — thread-safe single-slot audio frame store.
+#
+# Holds up to maxlen frames.  push() drops the oldest on overflow (throttled
+# REC-014 log).  pop_latest_or_silence() returns the NEWEST available frame
+# and discards all older ones — the writer never plays stale/delayed audio.
+# If the buffer is empty, pop_latest_or_silence() returns the caller-supplied
+# silence frame.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FrameBuffer:
+
+    _DROP_LOG_THROTTLE = 1.0
+
+    def __init__(self, maxlen: int, source_name: str) -> None:
+        self._lock = threading.Lock()
+        self._buf: collections.deque = collections.deque(maxlen=maxlen)
+        self._name = source_name
+        self._last_drop_log: float = 0.0
+
+    def push(self, frame: bytes) -> None:
+        with self._lock:
+            if len(self._buf) >= (self._buf.maxlen or 0):
+                now = time.monotonic()
+                if now - self._last_drop_log >= self._DROP_LOG_THROTTLE:
+                    log.warning(
+                        "[REC-014] %s queue overflow — dropping oldest frame",
+                        self._name,
+                    )
+                    self._last_drop_log = now
+            self._buf.append(frame)
+
+    def pop_latest_or_silence(self, silence: bytes) -> "tuple[bytes, int]":
+        """Return (newest_frame, n_older_discarded). Clears all older frames."""
+        with self._lock:
+            n = len(self._buf)
+            if n == 0:
+                return silence, 0
+            frame = self._buf[-1]
+            dropped = n - 1
+            self._buf.clear()
+            return frame, dropped
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buf.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._buf)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _SourceReader — owns the blocking stream.read() for ONE audio source.
 #
 # Runs in its own daemon thread.  Reads one chunk, validates byte count,
 # downmixes stereo→mono, resamples to mix_rate, normalises to exact
-# chunk_bytes, then appends to the writer's bounded deque.
+# chunk_bytes, then pushes to a _FrameBuffer shared with _AudioWriter.
+#
+# Paced to one chunk per source_block_seconds so it never floods the buffer
+# when stream.read() returns faster than real-time.
 #
 # Never writes WAV files.  Only the _AudioWriter does that.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _SourceReader(threading.Thread):
 
-    _DROP_LOG_THROTTLE = 1.0  # minimum seconds between overflow log lines
+    _PACE_LAG_LOG_THROTTLE = 1.0  # minimum seconds between pace-lag log lines
 
     def __init__(
         self,
@@ -385,7 +496,7 @@ class _SourceReader(threading.Thread):
         source_channels: int,
         source_rate: int,
         mix_rate: int,
-        queue: "collections.deque[bytes]",
+        frame_buf: "_FrameBuffer",
     ) -> None:
         super().__init__(name=name, daemon=True)
         self._stop_event = stop_event
@@ -394,13 +505,16 @@ class _SourceReader(threading.Thread):
         self._source_channels = source_channels
         self._source_rate = source_rate
         self._mix_rate = mix_rate
-        self._queue = queue
+        self._frame_buf = frame_buf
         self._lock = threading.Lock()
         self._stream: Optional[Any] = None
         self._online: bool = False
         self._chunk_bytes: int = chunk_size * sample_width
         self._block_seconds: float = chunk_size / max(1, mix_rate)
-        self._last_drop_log: float = 0.0
+        # Pacing uses source rate: hardware delivers chunk_size frames per
+        # source_block_seconds regardless of the mix-rate target.
+        self._source_block_seconds: float = chunk_size / max(1, source_rate)
+        self._last_pace_lag_log: float = 0.0
 
     # ── stream lifecycle ──────────────────────────────────────────────────────
 
@@ -446,6 +560,8 @@ class _SourceReader(threading.Thread):
             if not online or stream is None:
                 self._stop_event.wait(self._block_seconds)
                 continue
+
+            iter_start = time.monotonic()
 
             # ── blocking read ─────────────────────────────────────────────────
             try:
@@ -495,13 +611,25 @@ class _SourceReader(threading.Thread):
             elif len(raw) > self._chunk_bytes:
                 raw = raw[:self._chunk_bytes]
 
-            # ── enqueue (deque drops oldest automatically on overflow) ─────────
-            if len(self._queue) >= (self._queue.maxlen or 0):
+            # ── push to frame buffer (overflow logged inside _FrameBuffer) ────
+            self._frame_buf.push(raw)
+
+            # ── pace to source block duration ─────────────────────────────────
+            # If stream.read() returned faster than real-time (e.g. buffer
+            # pre-filled), sleep the remainder so we don't flood the buffer.
+            elapsed = time.monotonic() - iter_start
+            sleep_for = self._source_block_seconds - elapsed
+            if sleep_for > 0.001:
+                self._stop_event.wait(sleep_for)
+            elif elapsed > self._source_block_seconds * 1.5 and elapsed > 0.005:
                 now = time.monotonic()
-                if now - self._last_drop_log >= self._DROP_LOG_THROTTLE:
-                    log.warning("[REC-014] %s queue overflow — dropping oldest frame", self.name)
-                    self._last_drop_log = now
-            self._queue.append(raw)
+                if now - self._last_pace_lag_log >= self._PACE_LAG_LOG_THROTTLE:
+                    log.warning(
+                        "REC → source pace lag | source=%s | behind_ms=%.1f",
+                        self.name,
+                        (elapsed - self._source_block_seconds) * 1000,
+                    )
+                    self._last_pace_lag_log = now
 
         log.info("REC → %s exiting", self.name)
 
@@ -524,8 +652,8 @@ class _AudioWriter(threading.Thread):
     def __init__(
         self,
         stop_event: threading.Event,
-        lb_queue: "collections.deque[bytes]",
-        mic_queue: "collections.deque[bytes]",
+        lb_buf: "_FrameBuffer",
+        mic_buf: "_FrameBuffer",
         wav_file: wave.Wave_write,
         chunk_size: int,
         sample_width: int,
@@ -542,8 +670,8 @@ class _AudioWriter(threading.Thread):
     ) -> None:
         super().__init__(name="CaptureEngineWriter", daemon=True)
         self._stop_event = stop_event
-        self._lb_queue = lb_queue
-        self._mic_queue = mic_queue
+        self._lb_buf = lb_buf
+        self._mic_buf = mic_buf
         self._wav_file = wav_file
         self._chunk_size = chunk_size
         self._sample_width = sample_width
@@ -571,6 +699,10 @@ class _AudioWriter(threading.Thread):
         # Silence detection state
         self._silence_buf: bytearray = bytearray()
         self._silent_secs: int = 0
+
+        # Stale-drop throttle (one per source, 1s min between log lines)
+        self._lb_drop_log: float = 0.0
+        self._mic_drop_log: float = 0.0
 
     def run(self) -> None:
         log.info("REC → writer started | mix_rate=%sHz | mic_gain=%.2f | loopback_gain=%.2f",
@@ -600,25 +732,46 @@ class _AudioWriter(threading.Thread):
                 if self._stop_event.is_set():
                     break
 
-                # ── pull frames or silence ────────────────────────────────────
-                lb_data = self._lb_queue.popleft() if self._lb_queue else silence
-                mic_data = self._mic_queue.popleft() if self._mic_queue else silence
+                # ── pull newest frame or silence (discard stale older frames) ─
+                lb_data, lb_dropped = self._lb_buf.pop_latest_or_silence(silence)
+                mic_data, mic_dropped = self._mic_buf.pop_latest_or_silence(silence)
+
+                if lb_dropped:
+                    now2 = time.monotonic()
+                    if now2 - self._lb_drop_log >= 1.0:
+                        log.warning(
+                            "REC → stale frames dropped | source=loopback | dropped=%d",
+                            lb_dropped,
+                        )
+                        self._lb_drop_log = now2
+
+                if mic_dropped:
+                    now2 = time.monotonic()
+                    if now2 - self._mic_drop_log >= 1.0:
+                        log.warning(
+                            "REC → stale frames dropped | source=mic | dropped=%d",
+                            mic_dropped,
+                        )
+                        self._mic_drop_log = now2
 
                 # ── reconnect trigger when either source is offline ───────────
-                if ((not self._lb_reader.is_online or not self._mic_reader.is_online)
-                        and self._reconnect_fn is not None):
+                if (
+                    not self._stop_event.is_set()
+                    and (not self._lb_reader.is_online or not self._mic_reader.is_online)
+                    and self._reconnect_fn is not None
+                ):
                     self._reconnect_fn()  # internally throttled to 2s
 
                 # ── debug stems (exact frames used for mixing) ────────────────
                 if self._debug_stems:
                     if self._loopback_debug_wav is not None:
                         try:
-                            self._loopback_debug_wav.writeframes(lb_data)
+                            self._loopback_debug_wav.writeframesraw(lb_data)
                         except Exception:
                             pass
                     if self._mic_debug_wav is not None:
                         try:
-                            self._mic_debug_wav.writeframes(mic_data)
+                            self._mic_debug_wav.writeframesraw(mic_data)
                         except Exception:
                             pass
 
@@ -649,9 +802,9 @@ class _AudioWriter(threading.Thread):
                 if time.monotonic() - self._level_timer >= self._LEVEL_LOG_INTERVAL:
                     self._do_level_log()
 
-                # ── WAV write ─────────────────────────────────────────────────
+                # ── WAV write (writeframesraw: close() finalises header) ──────
                 try:
-                    self._wav_file.writeframes(write_data)
+                    self._wav_file.writeframesraw(write_data)
                     self._on_bytes_written(len(write_data))
                 except Exception:
                     log.exception("[REC-005] WAV write error — writer exiting")
@@ -748,7 +901,7 @@ class CaptureEngine:
 
     Locking:
       `_lock` (RLock) guards every mutable attribute. The record loop holds the
-      lock only briefly (around `wave_file.writeframes`) to keep stream reads
+      lock only briefly to keep stream reads
       from being blocked by `stop()` or recovery.
     """
 
@@ -804,6 +957,7 @@ class CaptureEngine:
         self._reconnect_lock = threading.Lock()
         self._reconnect_thread: Optional[threading.Thread] = None
         self._last_reconnect_attempt_ts: float = 0.0
+        self._reconnect_disabled: bool = False  # set True by stop() before stop_event
 
         # Actual channel count the mic stream was opened with (1 or 2).
         # Set by _open_stream(); independent of the output WAV channel count.
@@ -818,8 +972,8 @@ class CaptureEngine:
         self._loopback_debug_path: Optional[str] = None
 
         # Three-thread capture: LoopbackReader + MicReader + Writer
-        self._lb_queue: collections.deque = collections.deque(maxlen=24)
-        self._mic_queue: collections.deque = collections.deque(maxlen=24)
+        self._lb_buf: _FrameBuffer = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
+        self._mic_buf: _FrameBuffer = _FrameBuffer(maxlen=24, source_name="MicReader")
         self._lb_reader: Optional[_SourceReader] = None
         self._mic_reader: Optional[_SourceReader] = None
 
@@ -860,6 +1014,7 @@ class CaptureEngine:
                 return False
 
             self._stop_event.clear()
+            self._reconnect_disabled = False
             self._device_manager.reinit_pyaudio()
             self._watchdog_stop.clear()
             self._tried_devices = []
@@ -875,8 +1030,8 @@ class CaptureEngine:
             self._loopback_debug_path = None
             self._lb_reader = None
             self._mic_reader = None
-            self._lb_queue = collections.deque(maxlen=24)
-            self._mic_queue = collections.deque(maxlen=24)
+            self._lb_buf = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
+            self._mic_buf = _FrameBuffer(maxlen=24, source_name="MicReader")
 
             # Open WASAPI loopback (captures incoming voice / system audio)
             self._loopback_stream = self._open_loopback_stream()
@@ -953,7 +1108,7 @@ class CaptureEngine:
                 source_channels=self._loopback_channels,
                 source_rate=self._loopback_rate,
                 mix_rate=self._mix_rate,
-                queue=self._lb_queue,
+                frame_buf=self._lb_buf,
             )
             if self._loopback_stream is not None:
                 lb_reader.set_stream(
@@ -971,7 +1126,7 @@ class CaptureEngine:
                 source_channels=self._mic_channels,
                 source_rate=self._actual_sample_rate,
                 mix_rate=self._mix_rate,
-                queue=self._mic_queue,
+                frame_buf=self._mic_buf,
             )
             if self._mic_stream is not None:
                 mic_reader.set_stream(
@@ -984,8 +1139,8 @@ class CaptureEngine:
             # ── Create writer thread ──────────────────────────────────────────
             writer = _AudioWriter(
                 stop_event=self._stop_event,
-                lb_queue=self._lb_queue,
-                mic_queue=self._mic_queue,
+                lb_buf=self._lb_buf,
+                mic_buf=self._mic_buf,
                 wav_file=self._wav_file,
                 chunk_size=self._chunk_size,
                 sample_width=self._sample_width,
@@ -1034,6 +1189,9 @@ class CaptureEngine:
                     and stream is None and loopback_stream is None
                     and self._wav_file is None and lb_reader is None):
                 return False
+            # Disable reconnect before signalling stop so any in-flight
+            # reconnect thread bails out before opening new streams.
+            self._reconnect_disabled = True
             self._record_thread = None
             self._watchdog_thread = None
             self._lb_reader = None
@@ -1169,7 +1327,10 @@ class CaptureEngine:
         """
         Starts a non-blocking daemon thread to reopen streams after USB
         device return.  If a reconnect thread is already running, does nothing.
+        Returns immediately if stop/finalization is in progress.
         """
+        if self._reconnect_disabled or self._stop_event.is_set():
+            return
         now = time.monotonic()
         with self._reconnect_lock:
             if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
@@ -1271,20 +1432,27 @@ class CaptureEngine:
                     )
 
             if need_mic:
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or self._reconnect_disabled:
                     return
-                device = self._device_manager.select_best_device()
-                if device:
+                device = self._device_manager.select_best_mic_device()
+                if device is None:
+                    log.warning(
+                        "REC → reconnect skipped; source still unavailable"
+                        " — no real mic found, mic stays offline"
+                    )
+                else:
+                    dev_name = str(device.get("name", "?"))
                     with self._lock:
                         self._device = device
-                        self._device_name = str(device.get("name", "?"))
+                        self._device_name = dev_name
                     opened = self._open_stream(device)  # sets self._stream on success
                     if opened:
                         discard_stream = None
                         new_mic_stream = None
                         mic_reader_local = None
                         with self._lock:
-                            if self._stop_event.is_set():
+                            if self._stop_event.is_set() or self._reconnect_disabled:
+                                # Stop raced us — close the freshly opened stream
                                 discard_stream = self._stream
                                 self._stream = None
                                 self._mic_stream = None
@@ -1299,21 +1467,28 @@ class CaptureEngine:
                             except Exception:
                                 pass
                             return
-                        # Inject new stream into the mic reader thread
+                        # Inject new stream into the running mic reader thread
                         if mic_reader_local is not None and new_mic_stream is not None:
                             mic_reader_local.set_stream(
                                 new_mic_stream, self._mic_channels, self._actual_sample_rate
                             )
-                        log.info(
-                            "REC → mic stream reopened after reconnect | device=%s",
-                            self._device_name,
-                        )
+                        # Classify restored device for logging
+                        dev_lower = dev_name.lower()
+                        if "usb" in dev_lower or any(
+                            kw in dev_lower for kw in DeviceManager.HEADSET_KEYWORDS
+                        ):
+                            log.info(
+                                "REC → USB/headset mic restored | device=%s", dev_name
+                            )
+                        else:
+                            log.info(
+                                "REC → using built-in microphone fallback | device=%s",
+                                dev_name,
+                            )
                     else:
                         log.warning(
                             "REC → mic reopen failed — writer continues with silence"
                         )
-                else:
-                    log.warning("REC → no mic device available during reconnect")
 
         except Exception:
             log.exception("REC → reconnect thread failed")
@@ -1859,41 +2034,57 @@ class Recorder:
         pre_start_snapshot = self._snapshot_output_dir(output_dir)
         output_path = self._generate_output_path(output_dir)
 
-        device = self._device_manager.select_best_device()
-        if device is None:
-            log.error("[DEV-003] No audio input devices found — no microphone capture available")
-            log.error("[REC-001] No audio input device — recording skipped")
-            # Loopback-only recording would require device=None path; fall through if needed
-            return False
+        # select_best_mic_device() never returns a [Loopback] device.
+        # Returns None when no real mic exists — recording still proceeds
+        # in loopback-only mode (mic channel writes silence until reconnect).
+        device = self._device_manager.select_best_mic_device()
 
-        dev_name_for_log = device.get("name", "?")
+        dev_name_for_log = device.get("name", "?") if device else ""
         had_usb = self._has_usb_wasapi_input_device()
-        if "usb" in dev_name_for_log.lower():
-            log.info("[DEV-USB] USB headset selected for recording | device=%s", dev_name_for_log)
-        elif not had_usb:
+
+        if device is None:
             log.warning(
-                "[DEV-USB] USB headset not connected — using fallback device: %s",
-                dev_name_for_log,
+                "REC → no real microphone available"
+                " — mic source will be silence until reconnect"
             )
         else:
-            log.info("REC → using input device: %s", dev_name_for_log)
+            dev_lower = dev_name_for_log.lower()
+            if "usb" in dev_lower or any(
+                kw in dev_lower for kw in DeviceManager.HEADSET_KEYWORDS
+            ):
+                log.info(
+                    "[DEV-USB] USB/headset mic selected for recording | device=%s",
+                    dev_name_for_log,
+                )
+            elif any(kw in dev_lower for kw in DeviceManager.BUILTIN_KEYWORDS):
+                log.info(
+                    "REC → using built-in microphone fallback | device=%s",
+                    dev_name_for_log,
+                )
+            else:
+                log.info(
+                    "REC → real mic selected | device=%s | api=%s",
+                    dev_name_for_log,
+                    device.get("host_api_name", "?"),
+                )
 
         _t_engine = time.monotonic()
         if not self._engine.start(output_path, device):
             return False
         _t_engine_elapsed = time.monotonic() - _t_engine
 
-        dev_idx = device.get("index")
-        dev_name = device.get("name", "?")
+        dev_idx = device.get("index") if device else None
+        dev_name = device.get("name", "?") if device else ""
 
-        # Mute check runs in a daemon thread — UIA traversal can take 20-30s
-        # on some systems; must never block start_recording() return.
-        threading.Thread(
-            target=self._do_mute_check,
-            args=(dev_idx, dev_name),
-            daemon=True,
-            name="mute-check",
-        ).start()
+        # Mute check only meaningful when a real mic is selected.
+        # UIA traversal can take 20-30s — always in a daemon thread.
+        if device is not None:
+            threading.Thread(
+                target=self._do_mute_check,
+                args=(dev_idx, dev_name),
+                daemon=True,
+                name="mute-check",
+            ).start()
 
         _t_ctx = time.monotonic()
         now = datetime.now()
@@ -2101,7 +2292,7 @@ class Recorder:
                 self._completed_contexts.append(ctx)
 
         output_dir = RECORDER_OUTPUT_DIR
-        device = self._device_manager.select_best_device()
+        device = self._device_manager.select_best_mic_device()
         output_path = self._generate_output_path(output_dir)
         pre_snap = self._snapshot_output_dir(output_dir)
 

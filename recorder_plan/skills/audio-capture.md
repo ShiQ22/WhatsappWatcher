@@ -16,28 +16,44 @@ The writer thread is stored in `_record_thread` for watchdog compatibility.
 
 `loopback.read()` can block for 2+ seconds on a WASAPI stall. When the reader and writer shared one thread, the WAV grew at ~0.63× wall-clock rate (confirmed: `[REC-013] writer lag | behind_ms=2090.0`). Separate threads let the writer schedule at exact 20ms intervals regardless of source read timing.
 
+## _FrameBuffer
+
+Thread-safe frame store shared between one `_SourceReader` and `_AudioWriter`.
+
+```python
+buf = _FrameBuffer(maxlen=24, source_name="LoopbackReader")
+buf.push(frame)                        # drops oldest + logs [REC-014] on overflow
+frame, dropped = buf.pop_latest_or_silence(silence)  # newest frame; discards older
+buf.clear()
+len(buf)
+```
+
+`pop_latest_or_silence()` always returns the most recent frame.  `dropped` is the
+number of older frames discarded in the same call.  This prevents stale/delayed audio.
+
 ## _SourceReader
 
 ```python
-# Per-source thread. Reads one chunk, downmixes stereo→mono, resamples,
-# normalises to exact chunk_bytes, appends to bounded deque(maxlen=24).
+# Per-source thread. Reads one chunk, downmixes, resamples, pushes to _FrameBuffer.
+# Paced to one chunk per source_block_seconds to prevent buffer flooding.
 reader = _SourceReader(
-    name="LoopbackReader",       # or "MicReader"
+    name="LoopbackReader",          # or "MicReader"
     stop_event=stop_event,
-    chunk_size=960,              # frames per chunk (20ms at 48 kHz)
-    sample_width=2,              # 16-bit PCM
-    source_channels=2,           # stream's native channel count
-    source_rate=48000,           # stream's native sample rate
-    mix_rate=48000,              # output/WAV rate
-    queue=lb_queue,              # deque(maxlen=24) owned by engine
+    chunk_size=960,                 # frames per chunk (20ms at 48 kHz)
+    sample_width=2,                 # 16-bit PCM
+    source_channels=2,              # stream's native channel count
+    source_rate=48000,              # stream's native sample rate
+    mix_rate=48000,                 # output/WAV rate
+    frame_buf=lb_buf,               # _FrameBuffer owned by engine
 )
 reader.set_stream(stream, source_channels, source_rate)  # inject stream
 reader.go_offline()   # unblocks read() via stop_stream(), marks offline
 reader.is_online      # property
 ```
 
-Queue policy: `deque(maxlen=24)` = ~480ms. Oldest is dropped automatically on overflow.
-Overflow is logged `[REC-014]`, throttled to once per second.
+Pacing: `stop_event.wait(chunk_size/source_rate - elapsed)` after each push.
+Overflow logged `[REC-014]` inside `_FrameBuffer.push()`.
+Pace lag logged `REC → source pace lag` if `elapsed > 1.5 × source_block_seconds`.
 
 ## _AudioWriter
 
@@ -45,24 +61,26 @@ Overflow is logged `[REC-014]`, throttled to once per second.
 # Writer thread. Wall-clock scheduled, never calls stream.read().
 writer = _AudioWriter(
     stop_event=stop_event,
-    lb_queue=lb_queue,
-    mic_queue=mic_queue,
+    lb_buf=lb_buf,               # _FrameBuffer
+    mic_buf=mic_buf,             # _FrameBuffer
     wav_file=wav_file,
     chunk_size=960, sample_width=2, mix_rate=48000,
-    mic_gain=0.75,           # from config
-    loopback_gain=0.65,      # from config
+    mic_gain=0.75,               # from config
+    loopback_gain=0.65,          # from config
     debug_stems=True,
-    mic_debug_wav=...,       # wave.Wave_write or None
+    mic_debug_wav=...,           # wave.Wave_write or None
     loopback_debug_wav=...,
     lb_reader=lb_reader,
     mic_reader=mic_reader,
     on_bytes_written=engine._add_bytes_written,
-    reconnect_fn=engine._try_reconnect_streams_async,  # called when both offline
+    reconnect_fn=engine._try_reconnect_streams_async,
 )
 ```
 
 Writer scheduling: absolute `next_tick += block_seconds` each iteration (no drift).
 If behind by >10ms, logs `[REC-013]` and resets `next_tick` to prevent catch-up storm.
+Pulls with `pop_latest_or_silence()` — newest frame only, stale frames discarded.
+Uses `writeframesraw()` for both main WAV and debug stems; `wave.close()` finalises header.
 
 Mixing formula (int32 intermediate, clamped to int16):
 ```python
@@ -145,14 +163,32 @@ stop() called
   → _finalize_wav()
 ```
 
+## Mic device selection
+
+`DeviceManager.select_best_mic_device()` calls `list_real_mic_devices()` which
+excludes all `[Loopback]` devices.  Three outcomes:
+
+| Situation | `select_best_mic_device()` | Behaviour |
+|-----------|---------------------------|-----------|
+| USB/headset present | USB/headset device | MicReader starts with stream |
+| USB absent, built-in exists | Built-in device | Fallback; log `REC → using built-in microphone fallback` |
+| No real mic | `None` | MicReader starts offline; log `REC → no real microphone available` |
+
+Loopback selection is separate inside `_open_loopback_stream()` — never affects mic.
+
 ## USB disconnect/reconnect
 
 On disconnect: `on_usb_disconnect()` → `lb_reader.go_offline()` + `mic_reader.go_offline()`
 Writer fills silence for offline sources.
 
-On reconnect: `_try_reconnect_streams()` reopens missing stream(s), then calls
-`reader.set_stream(new_stream, channels, rate)` to inject the new stream into the running reader.
+On reconnect: `_try_reconnect_streams()` reopens missing stream(s) using
+`select_best_mic_device()` for mic (never loopback), then calls
+`reader.set_stream(new_stream, channels, rate)` to inject the new stream.
 PyAudio reinit only when BOTH streams are missing.
+
+Stop/reconnect race: `_reconnect_disabled` flag is set `True` by `stop()` before
+`stop_event.set()`.  `_try_reconnect_streams_async()` returns immediately if disabled.
+If a stream was opened just before the race, it is closed best-effort before returning.
 
 ## Config
 
