@@ -38,6 +38,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "watchdog_recovery_attempts": 2,
         "polling_fallback_interval_seconds": 2.0,
         "debug_stems": False,
+        "mic_gain": 0.75,
+        "loopback_gain": 0.65,
     },
     "watcher": {
         "poll_interval_seconds": 0.8,
@@ -195,6 +197,8 @@ RECORDER_POLLING_FALLBACK_INTERVAL_SECONDS: float = float(
     RECORDER.get("polling_fallback_interval_seconds", _recorder_defaults["polling_fallback_interval_seconds"])
 )
 RECORDER_DEBUG_STEMS: bool = bool(RECORDER.get("debug_stems", _recorder_defaults.get("debug_stems", False)))
+RECORDER_MIC_GAIN: float = float(RECORDER.get("mic_gain", _recorder_defaults.get("mic_gain", 0.75)))
+RECORDER_LOOPBACK_GAIN: float = float(RECORDER.get("loopback_gain", _recorder_defaults.get("loopback_gain", 0.65)))
 
 # Backwards compatibility aliases — kept so frozen modules (main.py et al.) keep importing.
 # Point BANDICAM_PATH at a file that always exists so main.py's existence check passes

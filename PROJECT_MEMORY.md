@@ -8,18 +8,31 @@ backward-compat properties that return `None` / `False` so existing callers
 don't crash. All recording goes through `CaptureEngine` (PyAudio loopback +
 microphone).
 
-## Audio fix history
+## Audio pipeline architecture (current — 2026-05-08)
 
-- **Dual-stream mixing**: loopback (system audio) + microphone captured in
-  parallel and mixed sample-by-sample with int16 clamping.
-- **Stereo-to-mono conversion**: loopback opens as stereo when possible;
-  converted to mono before mixing with mic.
-- **Silence detection**: `[REC-009]` logged if both streams silent for >6s.
-- **Duration ratio check**: `[REC-010]` logged if written frames < 70% of
-  expected frames for elapsed time (indicates timing mismatch or buffer stall).
-- **Watchdog recovery**: dead record thread is detected and restarted; new
-  segment index allocated on each recovery. Gives up after
-  `RECORDER_WATCHDOG_RECOVERY_ATTEMPTS`.
+Three independent daemon threads inside `CaptureEngine`. `_record_loop` is
+**removed**.
+
+- **LoopbackReader** (`_SourceReader`): owns blocking `loopback.read()`. On WASAPI
+  stall it blocks in its own thread; the writer is unaffected.
+- **MicReader** (`_SourceReader`): owns blocking `mic.read()`.
+- **Writer** (`_AudioWriter`): wall-clock scheduled (`next_tick += block_seconds`).
+  Pulls from `deque(maxlen=24)` queues or silence. Applies `loopback_gain=0.65`
+  and `mic_gain=0.75`. Int32 mix, int16 clamp. Never calls `stream.read()`.
+- Queues: 24 frames × 20ms = ~480ms buffer. Overflow drops oldest, logs `[REC-014]`.
+- Level log every 4s: mic_rms, loopback_rms, mixed_rms, clipped, online state.
+- `_record_thread` points to writer for watchdog/`is_active` compatibility.
+
+**Root cause this fixed**: WAV ratio=0.63 on 19s call, `behind_ms=2090`.
+WASAPI loopback stall blocked the single `_record_loop` thread for 2 seconds;
+writer clock measured elapsed AFTER the blocking read and could not compensate.
+
+## Audio fix history (pre-three-thread)
+
+- **Stereo-to-mono conversion**: loopback and mic both downmix before mix step.
+- **Silence detection**: `[REC-009]` logged if both streams silent for >6s (now in writer).
+- **Duration ratio check**: `[REC-010]` logged if written frames < 70% of elapsed wall time.
+- **Watchdog recovery**: writer thread death → readers stopped → Recorder creates new segment.
 
 ## Direction no-downgrade guard + session latch (2026-05-08)
 

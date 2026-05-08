@@ -13,6 +13,23 @@ launcher.py
         └── uploader.py      → copies recording files to network share
 ```
 
+### recorder.py internal architecture (as of 2026-05-08)
+
+Three independent daemon threads inside `CaptureEngine`:
+
+```
+LoopbackReader (_SourceReader) ──── lb_queue (deque maxlen=24) ────┐
+                                                                    ├─► _AudioWriter
+MicReader      (_SourceReader) ──── mic_queue (deque maxlen=24) ───┘    (wall-clock WAV writes)
+```
+
+- Reader threads own blocking `stream.read()`. Writer never calls `stream.read()`.
+- Writer uses absolute `next_tick += block_seconds` scheduling (no drift).
+- Gain mixing: `int(lb * loopback_gain + mic * mic_gain)`, clamped int16.
+- On USB disconnect: `reader.go_offline()` unblocks blocking reads, writer fills silence.
+- On reconnect: `reader.set_stream(new_stream, ...)` injects new stream into running reader.
+- `_record_thread` points to the writer thread (watchdog compatibility).
+
 ### Poll loop flow (main.py `run()`)
 
 ```

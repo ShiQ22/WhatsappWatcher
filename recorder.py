@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import copy
 import faulthandler
 import logging
@@ -35,6 +36,8 @@ from config import (
     RECORDER_WATCHDOG_RECOVERY_ATTEMPTS,
     RECORDER_POLLING_FALLBACK_INTERVAL_SECONDS,
     RECORDER_DEBUG_STEMS,
+    RECORDER_MIC_GAIN,
+    RECORDER_LOOPBACK_GAIN,
 )
 
 log = logging.getLogger("watcher.recorder")
@@ -340,10 +343,384 @@ class DeviceManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CaptureEngine — owns the live PyAudio stream, the WAV file on disk, the
-# record thread that drains the stream, and the watchdog thread that recovers
-# from a dead record thread. CaptureEngine knows nothing about call lifecycle
-# or segments; that's Recorder's job.
+# Module-level audio helper — used by both _SourceReader and CaptureEngine.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resample_audio(data: bytes, from_rate: int, to_rate: int) -> bytes:
+    """Nearest-neighbour resample of mono 16-bit PCM. Returns bytes."""
+    if from_rate == to_rate or not data:
+        return data
+    samples = struct.unpack(f"<{len(data) // 2}h", data)
+    ratio = to_rate / from_rate
+    new_len = int(len(samples) * ratio)
+    if new_len == 0:
+        return b""
+    resampled = [
+        samples[min(int(i / ratio), len(samples) - 1)]
+        for i in range(new_len)
+    ]
+    return struct.pack(f"<{new_len}h", *resampled)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _SourceReader — owns the blocking stream.read() for ONE audio source.
+#
+# Runs in its own daemon thread.  Reads one chunk, validates byte count,
+# downmixes stereo→mono, resamples to mix_rate, normalises to exact
+# chunk_bytes, then appends to the writer's bounded deque.
+#
+# Never writes WAV files.  Only the _AudioWriter does that.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SourceReader(threading.Thread):
+
+    _DROP_LOG_THROTTLE = 1.0  # minimum seconds between overflow log lines
+
+    def __init__(
+        self,
+        name: str,
+        stop_event: threading.Event,
+        chunk_size: int,
+        sample_width: int,
+        source_channels: int,
+        source_rate: int,
+        mix_rate: int,
+        queue: "collections.deque[bytes]",
+    ) -> None:
+        super().__init__(name=name, daemon=True)
+        self._stop_event = stop_event
+        self._chunk_size = chunk_size
+        self._sample_width = sample_width
+        self._source_channels = source_channels
+        self._source_rate = source_rate
+        self._mix_rate = mix_rate
+        self._queue = queue
+        self._lock = threading.Lock()
+        self._stream: Optional[Any] = None
+        self._online: bool = False
+        self._chunk_bytes: int = chunk_size * sample_width
+        self._block_seconds: float = chunk_size / max(1, mix_rate)
+        self._last_drop_log: float = 0.0
+
+    # ── stream lifecycle ──────────────────────────────────────────────────────
+
+    def set_stream(self, stream: Any, source_channels: int, source_rate: int) -> None:
+        """Inject a new live stream. May be called from any thread."""
+        with self._lock:
+            self._stream = stream
+            self._source_channels = source_channels
+            self._source_rate = source_rate
+            self._online = True
+
+    def go_offline(self) -> None:
+        """
+        Mark offline and unblock any pending stream.read() via stop_stream().
+        Safe to call from any thread, including while run() is blocked.
+        """
+        with self._lock:
+            old_stream = self._stream
+            self._stream = None
+            self._online = False
+        if old_stream is not None:
+            try:
+                old_stream.stop_stream()
+            except Exception:
+                pass
+
+    @property
+    def is_online(self) -> bool:
+        with self._lock:
+            return self._online and self._stream is not None
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        log.info("REC → %s started", self.name)
+        while not self._stop_event.is_set():
+            with self._lock:
+                stream = self._stream
+                online = self._online
+                src_ch = self._source_channels
+                src_rate = self._source_rate
+
+            if not online or stream is None:
+                self._stop_event.wait(self._block_seconds)
+                continue
+
+            # ── blocking read ─────────────────────────────────────────────────
+            try:
+                raw = stream.read(self._chunk_size, exception_on_overflow=False)
+            except OSError:
+                if self._stop_event.is_set():
+                    break
+                log.warning("REC → %s read error — source offline", self.name)
+                with self._lock:
+                    self._online = False
+                    self._stream = None
+                continue
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+                log.exception("REC → %s read failed — source offline", self.name)
+                with self._lock:
+                    self._online = False
+                    self._stream = None
+                continue
+
+            # ── validate byte count ───────────────────────────────────────────
+            expected = self._chunk_size * src_ch * self._sample_width
+            if len(raw) < expected:
+                raw = raw + b"\x00" * (expected - len(raw))
+            elif len(raw) > expected:
+                raw = raw[:expected]
+
+            # ── stereo→mono downmix ───────────────────────────────────────────
+            if src_ch == 2:
+                samples = struct.unpack(f"<{len(raw) // 2}h", raw)
+                if len(samples) % 2 != 0:
+                    samples = samples[:-1]
+                mono = [
+                    max(-32768, min(32767, (int(samples[i]) + int(samples[i + 1])) // 2))
+                    for i in range(0, len(samples), 2)
+                ]
+                raw = struct.pack(f"<{len(mono)}h", *mono)
+
+            # ── resample ──────────────────────────────────────────────────────
+            if src_rate != self._mix_rate:
+                raw = _resample_audio(raw, src_rate, self._mix_rate)
+
+            # ── normalise to exact chunk_bytes ────────────────────────────────
+            if len(raw) < self._chunk_bytes:
+                raw = raw + b"\x00" * (self._chunk_bytes - len(raw))
+            elif len(raw) > self._chunk_bytes:
+                raw = raw[:self._chunk_bytes]
+
+            # ── enqueue (deque drops oldest automatically on overflow) ─────────
+            if len(self._queue) >= (self._queue.maxlen or 0):
+                now = time.monotonic()
+                if now - self._last_drop_log >= self._DROP_LOG_THROTTLE:
+                    log.warning("[REC-014] %s queue overflow — dropping oldest frame", self.name)
+                    self._last_drop_log = now
+            self._queue.append(raw)
+
+        log.info("REC → %s exiting", self.name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _AudioWriter — consumes frames from two bounded queues, applies gain, mixes,
+# and writes one chunk per wall-clock slot to the WAV file.
+#
+# Uses absolute time.monotonic() scheduling so the WAV grows at wall-clock
+# rate regardless of source timing.  Never calls stream.read().
+#
+# Also owns debug stem WAV writes and silence/level logging.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _AudioWriter(threading.Thread):
+
+    _LEVEL_LOG_INTERVAL = 4.0    # seconds between RMS level log lines
+    _SILENCE_RMS_THRESHOLD = 10  # RMS below this counts as silence
+
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        lb_queue: "collections.deque[bytes]",
+        mic_queue: "collections.deque[bytes]",
+        wav_file: wave.Wave_write,
+        chunk_size: int,
+        sample_width: int,
+        mix_rate: int,
+        mic_gain: float,
+        loopback_gain: float,
+        debug_stems: bool,
+        mic_debug_wav: Optional[wave.Wave_write],
+        loopback_debug_wav: Optional[wave.Wave_write],
+        lb_reader: "_SourceReader",
+        mic_reader: "_SourceReader",
+        on_bytes_written: Callable[[int], None],
+        reconnect_fn: Optional[Callable[[], None]] = None,
+    ) -> None:
+        super().__init__(name="CaptureEngineWriter", daemon=True)
+        self._stop_event = stop_event
+        self._lb_queue = lb_queue
+        self._mic_queue = mic_queue
+        self._wav_file = wav_file
+        self._chunk_size = chunk_size
+        self._sample_width = sample_width
+        self._mix_rate = mix_rate
+        self._mic_gain = float(mic_gain)
+        self._loopback_gain = float(loopback_gain)
+        self._debug_stems = debug_stems
+        self._mic_debug_wav = mic_debug_wav
+        self._loopback_debug_wav = loopback_debug_wav
+        self._lb_reader = lb_reader
+        self._mic_reader = mic_reader
+        self._on_bytes_written = on_bytes_written
+        self._reconnect_fn = reconnect_fn
+        self._chunk_bytes: int = chunk_size * sample_width
+        self._block_seconds: float = chunk_size / max(1, mix_rate)
+
+        # Level logging accumulators
+        self._level_timer: float = 0.0
+        self._mic_sq: float = 0.0
+        self._lb_sq: float = 0.0
+        self._mix_sq: float = 0.0
+        self._level_frames: int = 0
+        self._clipped: int = 0
+
+        # Silence detection state
+        self._silence_buf: bytearray = bytearray()
+        self._silent_secs: int = 0
+
+    def run(self) -> None:
+        log.info("REC → writer started | mix_rate=%sHz | mic_gain=%.2f | loopback_gain=%.2f",
+                 self._mix_rate, self._mic_gain, self._loopback_gain)
+        silence = b"\x00" * self._chunk_bytes
+        block_seconds = self._block_seconds
+        count = self._chunk_bytes // 2  # int16 samples per chunk
+
+        next_tick = time.monotonic()
+        self._level_timer = next_tick
+
+        try:
+            while not self._stop_event.is_set():
+                # ── absolute scheduling ───────────────────────────────────────
+                now = time.monotonic()
+                wait = next_tick - now
+                if wait > 0:
+                    if self._stop_event.wait(wait):
+                        break
+                elif (now - next_tick) * 1000 > 10:
+                    log.warning(
+                        "[REC-013] writer lag | behind_ms=%.1f",
+                        (now - next_tick) * 1000,
+                    )
+                    next_tick = time.monotonic() + block_seconds
+
+                if self._stop_event.is_set():
+                    break
+
+                # ── pull frames or silence ────────────────────────────────────
+                lb_data = self._lb_queue.popleft() if self._lb_queue else silence
+                mic_data = self._mic_queue.popleft() if self._mic_queue else silence
+
+                # ── reconnect trigger when both sources offline ────────────────
+                if (not self._lb_reader.is_online and not self._mic_reader.is_online
+                        and self._reconnect_fn is not None):
+                    self._reconnect_fn()  # internally throttled to 2s
+
+                # ── debug stems (exact frames used for mixing) ────────────────
+                if self._debug_stems:
+                    if self._loopback_debug_wav is not None:
+                        try:
+                            self._loopback_debug_wav.writeframes(lb_data)
+                        except Exception:
+                            pass
+                    if self._mic_debug_wav is not None:
+                        try:
+                            self._mic_debug_wav.writeframes(mic_data)
+                        except Exception:
+                            pass
+
+                # ── gain-mix: float/int32 intermediate, clamp to int16 ────────
+                lb_s = struct.unpack(f"<{count}h", lb_data[:count * 2])
+                mic_s = struct.unpack(f"<{count}h", mic_data[:count * 2])
+                mixed: List[int] = []
+                clipped_chunk = 0
+                for i in range(count):
+                    val = int(lb_s[i] * self._loopback_gain + mic_s[i] * self._mic_gain)
+                    if val > 32767:
+                        val = 32767
+                        clipped_chunk += 1
+                    elif val < -32768:
+                        val = -32768
+                        clipped_chunk += 1
+                    mixed.append(val)
+                self._clipped += clipped_chunk
+
+                write_data = struct.pack(f"<{count}h", *mixed)
+
+                # ── accumulate RMS for level log ──────────────────────────────
+                self._lb_sq += sum(s * s for s in lb_s)
+                self._mic_sq += sum(s * s for s in mic_s)
+                self._mix_sq += sum(s * s for s in mixed)
+                self._level_frames += count
+
+                if time.monotonic() - self._level_timer >= self._LEVEL_LOG_INTERVAL:
+                    self._do_level_log()
+
+                # ── WAV write ─────────────────────────────────────────────────
+                try:
+                    self._wav_file.writeframes(write_data)
+                    self._on_bytes_written(len(write_data))
+                except Exception:
+                    log.exception("[REC-005] WAV write error — writer exiting")
+                    break
+
+                # ── silence detection ─────────────────────────────────────────
+                self._silence_buf.extend(write_data)
+                check_size = self._mix_rate * 3 * 2
+                if len(self._silence_buf) >= check_size:
+                    smp = struct.unpack(
+                        f"<{check_size // 2}h",
+                        bytes(self._silence_buf[:check_size]),
+                    )
+                    rms = math.sqrt(sum(s * s for s in smp) / len(smp)) if smp else 0.0
+                    if rms < self._SILENCE_RMS_THRESHOLD:
+                        self._silent_secs += 3
+                        if self._silent_secs >= 6:
+                            log.warning(
+                                "[REC-009] Recording silent | rms=%.1f | silent=%ds"
+                                " | lb=%s mic=%s",
+                                rms, self._silent_secs,
+                                "ON" if self._lb_reader.is_online else "OFF",
+                                "ON" if self._mic_reader.is_online else "OFF",
+                            )
+                    else:
+                        if self._silent_secs > 0:
+                            log.info("REC → audio detected | rms=%.1f", rms)
+                        self._silent_secs = 0
+                    self._silence_buf = bytearray()
+
+                # ── advance absolute tick ─────────────────────────────────────
+                next_tick += block_seconds
+
+        finally:
+            log.info("REC → writer exiting")
+
+    def _do_level_log(self) -> None:
+        frames = self._level_frames
+        if frames > 0:
+            mic_rms = math.sqrt(self._mic_sq / frames)
+            lb_rms = math.sqrt(self._lb_sq / frames)
+            mix_rms = math.sqrt(self._mix_sq / frames)
+        else:
+            mic_rms = lb_rms = mix_rms = 0.0
+        log.info(
+            "REC → levels | mic_rms=%.1f | loopback_rms=%.1f | mixed_rms=%.1f"
+            " | clipped=%d | mic_online=%s | loopback_online=%s",
+            mic_rms, lb_rms, mix_rms, self._clipped,
+            "Y" if self._mic_reader.is_online else "N",
+            "Y" if self._lb_reader.is_online else "N",
+        )
+        self._mic_sq = 0.0
+        self._lb_sq = 0.0
+        self._mix_sq = 0.0
+        self._level_frames = 0
+        self._clipped = 0
+        self._level_timer = time.monotonic()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CaptureEngine — owns PyAudio streams, the WAV file, and three capture
+# threads: LoopbackReader, MicReader, and Writer/Mixer.
+#
+# Threading model:
+#   _SourceReader "LoopbackReader" — blocking loopback stream.read() only
+#   _SourceReader "MicReader"      — blocking mic stream.read() only
+#   _AudioWriter  "CaptureEngineWriter" — wall-clock-scheduled WAV writes;
+#                                          never calls stream.read()
+#   _watchdog_thread               — monitors writer, triggers recovery
 #
 # Failure codes used here:
 #   REC-002  stream open failed on a specific device (warning, retried)
@@ -353,7 +730,8 @@ class DeviceManager:
 #   REC-006  WAV finalization failed (error)
 #   REC-007  MP3 conversion failed (warning, WAV is kept)
 #   REC-008  failed to open WAV file for writing (error)
-#   HLT-001  watchdog detected dead record thread, recovering (warning)
+#   REC-014  source reader queue overflow — oldest frame dropped (warning)
+#   HLT-001  watchdog detected dead writer thread, stopping readers (warning)
 #   HLT-002  recovery attempts exhausted (error)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -439,6 +817,12 @@ class CaptureEngine:
         self._mic_debug_path: Optional[str] = None
         self._loopback_debug_path: Optional[str] = None
 
+        # Three-thread capture: LoopbackReader + MicReader + Writer
+        self._lb_queue: collections.deque = collections.deque(maxlen=24)
+        self._mic_queue: collections.deque = collections.deque(maxlen=24)
+        self._lb_reader: Optional[_SourceReader] = None
+        self._mic_reader: Optional[_SourceReader] = None
+
     # ── public API ───────────────────────────────────────────────────────────
 
     @property
@@ -484,13 +868,15 @@ class CaptureEngine:
             self._bytes_written = 0
             self._device = device
             self._device_name = str(device.get("name", "?")) if device else ""
-            self._silence_buffer = bytearray()
-            self._silent_secs = 0
             self._mic_channels = 1
             self._mic_debug_wav = None
             self._loopback_debug_wav = None
             self._mic_debug_path = None
             self._loopback_debug_path = None
+            self._lb_reader = None
+            self._mic_reader = None
+            self._lb_queue = collections.deque(maxlen=24)
+            self._mic_queue = collections.deque(maxlen=24)
 
             # Open WASAPI loopback (captures incoming voice / system audio)
             self._loopback_stream = self._open_loopback_stream()
@@ -558,14 +944,70 @@ class CaptureEngine:
                 "+".join(streams_active), self._mix_rate,
             )
 
+            # ── Create source reader threads ──────────────────────────────────
+            lb_reader = _SourceReader(
+                name="LoopbackReader",
+                stop_event=self._stop_event,
+                chunk_size=self._chunk_size,
+                sample_width=self._sample_width,
+                source_channels=self._loopback_channels,
+                source_rate=self._loopback_rate,
+                mix_rate=self._mix_rate,
+                queue=self._lb_queue,
+            )
+            if self._loopback_stream is not None:
+                lb_reader.set_stream(
+                    self._loopback_stream,
+                    self._loopback_channels,
+                    self._loopback_rate,
+                )
+            self._lb_reader = lb_reader
+
+            mic_reader = _SourceReader(
+                name="MicReader",
+                stop_event=self._stop_event,
+                chunk_size=self._chunk_size,
+                sample_width=self._sample_width,
+                source_channels=self._mic_channels,
+                source_rate=self._actual_sample_rate,
+                mix_rate=self._mix_rate,
+                queue=self._mic_queue,
+            )
+            if self._mic_stream is not None:
+                mic_reader.set_stream(
+                    self._mic_stream,
+                    self._mic_channels,
+                    self._actual_sample_rate,
+                )
+            self._mic_reader = mic_reader
+
+            # ── Create writer thread ──────────────────────────────────────────
+            writer = _AudioWriter(
+                stop_event=self._stop_event,
+                lb_queue=self._lb_queue,
+                mic_queue=self._mic_queue,
+                wav_file=self._wav_file,
+                chunk_size=self._chunk_size,
+                sample_width=self._sample_width,
+                mix_rate=self._mix_rate,
+                mic_gain=RECORDER_MIC_GAIN,
+                loopback_gain=RECORDER_LOOPBACK_GAIN,
+                debug_stems=self._debug_stems,
+                mic_debug_wav=self._mic_debug_wav,
+                loopback_debug_wav=self._loopback_debug_wav,
+                lb_reader=lb_reader,
+                mic_reader=mic_reader,
+                on_bytes_written=self._add_bytes_written,
+                reconnect_fn=self._try_reconnect_streams_async,
+            )
+
+            # ── Start all three threads ───────────────────────────────────────
             self._record_started_monotonic = time.monotonic()
             self._thread_started_at = time.time()
-            self._record_thread = threading.Thread(
-                target=self._record_loop,
-                daemon=True,
-                name="CaptureEngineRecord",
-            )
-            self._record_thread.start()
+            lb_reader.start()
+            mic_reader.start()
+            writer.start()
+            self._record_thread = writer  # watchdog monitors the writer
 
             self._watchdog_thread = threading.Thread(
                 target=self._watchdog_loop,
@@ -579,30 +1021,38 @@ class CaptureEngine:
             return True
 
     def stop(self) -> bool:
-        """Signal stop, then: stop_stream → join → close (safe teardown order)."""
+        """Signal stop, then: go_offline → stop_stream → join readers → join writer → close."""
         with self._lock:
-            record_thread = self._record_thread
+            record_thread = self._record_thread   # writer thread
             watchdog_thread = self._watchdog_thread
+            lb_reader = self._lb_reader
+            mic_reader = self._mic_reader
             stream = self._stream
             loopback_stream = self._loopback_stream
             output_path = self._output_path
             if (record_thread is None and watchdog_thread is None
                     and stream is None and loopback_stream is None
-                    and self._wav_file is None):
+                    and self._wav_file is None and lb_reader is None):
                 return False
             self._record_thread = None
             self._watchdog_thread = None
+            self._lb_reader = None
+            self._mic_reader = None
             self._stream = None
             self._mic_stream = None
             self._loopback_stream = None
 
-        # 1. Signal stop
+        # 1. Signal stop to all threads
         self._stop_event.set()
         self._watchdog_stop.set()
 
-        # 2. stop_stream() on BOTH streams before joining
-        #    This unblocks any pending blocking stream.read() call immediately.
-        #    Safe to call while read() is active — does NOT free memory.
+        # 2. Unblock any pending blocking stream.read() inside reader threads.
+        #    go_offline() calls stop_stream() and nulls the reader's stream ref.
+        for reader in (lb_reader, mic_reader):
+            if reader is not None:
+                reader.go_offline()
+
+        # Belt-and-suspenders: also stop_stream() via our own refs.
         for s in (loopback_stream, stream):
             if s is not None:
                 try:
@@ -610,18 +1060,27 @@ class CaptureEngine:
                 except Exception:
                     pass
 
-        # 3. Join threads — exit quickly since stream.read() is now unblocked
+        # 3. Join readers first (they unblock quickly after go_offline)
+        for reader in (lb_reader, mic_reader):
+            if reader is not None:
+                reader.join(timeout=2.0)
+                if reader.is_alive():
+                    log.warning("[REC-004] %s still alive after 2.0s", reader.name)
+
+        # 4. Join writer — it may still flush the last partial second of queued frames
         if record_thread is not None:
-            record_thread.join(timeout=2.0)
+            record_thread.join(timeout=5.0)
             if record_thread.is_alive():
                 log.warning(
-                    "[REC-004] Record thread still alive after 2.0s | path=%s",
+                    "[REC-004] Writer thread still alive after 5.0s | path=%s",
                     output_path,
                 )
+
+        # 5. Join watchdog
         if watchdog_thread is not None:
             watchdog_thread.join(timeout=2.0)
 
-        # 4. close() AFTER thread is confirmed dead — now safe
+        # 6. close() streams AFTER all threads confirmed dead
         for s in (loopback_stream, stream):
             if s is not None:
                 try:
@@ -629,8 +1088,7 @@ class CaptureEngine:
                 except Exception:
                     pass
 
-        # Safety net: record thread's finally block calls _finalize_wav() too,
-        # but if the thread never started or died before reaching it, do it here.
+        # 7. Finalize WAV (writer's finally block does this too; this is the safety net)
         with self._lock:
             self._finalize_wav()
 
@@ -674,19 +1132,27 @@ class CaptureEngine:
     def on_usb_disconnect(self) -> None:
         """
         Called immediately when the USB audio device is removed.
-        Nulls stream references under lock so the record loop never reads a
-        dead WASAPI stream (which would cause a Windows access violation).
+        Marks both source readers offline so their blocking stream.read() is
+        unblocked via stop_stream().  Writer continues filling silence.
         Does NOT call close() — the OS WASAPI topology has already changed;
-        close() can access-violate on a removed device.  stop_stream() is
-        best-effort only.
+        close() can access-violate on a removed device.
         """
         with self._lock:
             lb = self._loopback_stream
             mic = self._stream
+            lb_reader = self._lb_reader
+            mic_reader = self._mic_reader
             self._loopback_stream = None
             self._stream = None
             self._mic_stream = None
 
+        # go_offline() calls stop_stream() inside — unblocks blocking reads
+        if lb_reader is not None:
+            lb_reader.go_offline()
+        if mic_reader is not None:
+            mic_reader.go_offline()
+
+        # Belt-and-suspenders: also attempt stop_stream() via our captured refs
         for s in (lb, mic):
             if s is not None:
                 try:
@@ -696,7 +1162,7 @@ class CaptureEngine:
 
         log.info(
             "REC → USB disconnect handled | streams detached"
-            " | record loop will write silence until reconnect"
+            " | writer fills silence until reconnect"
         )
 
     def _try_reconnect_streams_async(self) -> None:
@@ -765,16 +1231,13 @@ class CaptureEngine:
                     assigned = False
                     with self._lock:
                         if self._stop_event.is_set():
-                            # Recorder is stopping; close the newly opened stream
-                            # (this is a valid stream we own — safe to close)
                             pass
                         elif self._loopback_stream is None:
                             self._loopback_stream = new_lb
                             self._mix_rate = self._loopback_rate
                             assigned = True
                         else:
-                            # Another path already assigned a stream; discard ours
-                            pass
+                            pass  # Another path already assigned a stream
                     if not assigned:
                         try:
                             new_lb.stop_stream()
@@ -784,10 +1247,15 @@ class CaptureEngine:
                         if self._stop_event.is_set():
                             return
                     else:
+                        # Inject new stream into the loopback reader thread
+                        with self._lock:
+                            lb_reader = self._lb_reader
+                        if lb_reader is not None:
+                            lb_reader.set_stream(new_lb, self._loopback_channels, self._loopback_rate)
                         log.info("REC → loopback stream reopened after reconnect")
                 else:
                     log.warning(
-                        "REC → loopback reopen failed — record loop continues with silence"
+                        "REC → loopback reopen failed — writer continues with silence"
                     )
 
             if need_mic:
@@ -801,6 +1269,8 @@ class CaptureEngine:
                     opened = self._open_stream(device)  # sets self._stream on success
                     if opened:
                         discard_stream = None
+                        new_mic_stream = None
+                        mic_reader_local = None
                         with self._lock:
                             if self._stop_event.is_set():
                                 discard_stream = self._stream
@@ -808,6 +1278,8 @@ class CaptureEngine:
                                 self._mic_stream = None
                             else:
                                 self._mic_stream = self._stream
+                                new_mic_stream = self._stream
+                                mic_reader_local = self._mic_reader
                         if discard_stream is not None:
                             try:
                                 discard_stream.stop_stream()
@@ -815,13 +1287,18 @@ class CaptureEngine:
                             except Exception:
                                 pass
                             return
+                        # Inject new stream into the mic reader thread
+                        if mic_reader_local is not None and new_mic_stream is not None:
+                            mic_reader_local.set_stream(
+                                new_mic_stream, self._mic_channels, self._actual_sample_rate
+                            )
                         log.info(
                             "REC → mic stream reopened after reconnect | device=%s",
                             self._device_name,
                         )
                     else:
                         log.warning(
-                            "REC → mic reopen failed — record loop continues with silence"
+                            "REC → mic reopen failed — writer continues with silence"
                         )
                 else:
                     log.warning("REC → no mic device available during reconnect")
@@ -1085,19 +1562,8 @@ class CaptureEngine:
 
     @staticmethod
     def _resample(data: bytes, from_rate: int, to_rate: int) -> bytes:
-        """Nearest-neighbour resample — adequate quality for voice."""
-        if from_rate == to_rate or not data:
-            return data
-        samples = struct.unpack(f"<{len(data) // 2}h", data)
-        ratio = to_rate / from_rate
-        new_len = int(len(samples) * ratio)
-        if new_len == 0:
-            return b""
-        resampled = [
-            samples[min(int(i / ratio), len(samples) - 1)]
-            for i in range(new_len)
-        ]
-        return struct.pack(f"<{new_len}h", *resampled)
+        """Nearest-neighbour resample — delegates to module-level helper."""
+        return _resample_audio(data, from_rate, to_rate)
 
     def _finalize_wav(self) -> None:
         wav = self._wav_file
@@ -1147,263 +1613,7 @@ class CaptureEngine:
         except Exception:
             log.exception("[REC-010] Duration check failed")
 
-    # ── internal: record + watchdog threads ──────────────────────────────────
-
-    def _record_loop(self) -> None:
-        log.info("REC → record thread started | device=%s | file=%s",
-                 self._device_name, self._output_path)
-        # Computed once — constant for the lifetime of this recording session.
-        _chunk_bytes = self._chunk_size * self._sample_width
-        _block_seconds = self._chunk_size / max(1, self._mix_rate)
-        try:
-            while not self._stop_event.is_set():
-                _iter_start = time.monotonic()
-                try:
-                    loopback_data: Optional[bytes] = None
-                    mic_data: Optional[bytes] = None
-
-                    # ── Loopback read (blocking) ──────────────────────────────
-                    lb_stream = self._loopback_stream
-                    if lb_stream is not None:
-                        try:
-                            raw = lb_stream.read(
-                                self._chunk_size,
-                                exception_on_overflow=False,
-                            )
-                            # Validate pre-downmix byte count
-                            _lb_expected = (
-                                self._chunk_size * self._loopback_channels * self._sample_width
-                            )
-                            if len(raw) < _lb_expected:
-                                log.warning(
-                                    "REC → loopback read short | got=%d expected=%d | padding",
-                                    len(raw), _lb_expected,
-                                )
-                                raw = raw + b"\x00" * (_lb_expected - len(raw))
-                            elif len(raw) > _lb_expected:
-                                log.warning(
-                                    "REC → loopback read long | got=%d expected=%d | trimming",
-                                    len(raw), _lb_expected,
-                                )
-                                raw = raw[:_lb_expected]
-                            if self._loopback_channels == 2:
-                                samples = struct.unpack(f"<{len(raw)//2}h", raw)
-                                if len(samples) % 2 != 0:
-                                    samples = samples[:-1]
-                                mono = [
-                                    max(-32768, min(32767,
-                                        (int(samples[i]) + int(samples[i + 1])) // 2))
-                                    for i in range(0, len(samples), 2)
-                                ]
-                                loopback_data = struct.pack(f"<{len(mono)}h", *mono)
-                            else:
-                                loopback_data = raw
-                            if self._loopback_rate != self._mix_rate:
-                                loopback_data = self._resample(
-                                    loopback_data,
-                                    self._loopback_rate,
-                                    self._mix_rate,
-                                )
-                            # Normalize to exact output chunk size (handles resample rounding)
-                            if len(loopback_data) < _chunk_bytes:
-                                loopback_data = loopback_data + b"\x00" * (
-                                    _chunk_bytes - len(loopback_data)
-                                )
-                            elif len(loopback_data) > _chunk_bytes:
-                                loopback_data = loopback_data[:_chunk_bytes]
-                        except OSError as exc:
-                            if self._stop_event.is_set():
-                                break
-                            log.exception(
-                                "[REC-005] Loopback read error | errno=%s", exc.errno
-                            )
-                            try:
-                                lb_stream.stop_stream()
-                                lb_stream.close()
-                            except Exception:
-                                pass
-                            self._loopback_stream = None
-                        except Exception:
-                            if self._stop_event.is_set():
-                                break
-                            log.exception("[REC-005] Loopback read failed")
-                            self._loopback_stream = None
-
-                    # ── Mic read (non-blocking secondary) ────────────────────
-                    # Loopback drives timing via its blocking read above.
-                    # Mic only reads when data is already buffered — never blocks.
-                    mic_stream = self._stream
-                    if mic_stream is not None:
-                        try:
-                            available = mic_stream.get_read_available()
-                            if available >= self._chunk_size:
-                                raw = mic_stream.read(
-                                    self._chunk_size,
-                                    exception_on_overflow=False,
-                                )
-                                # Validate: expected bytes = chunk_size × channels × width
-                                expected_bytes = (
-                                    self._chunk_size * self._mic_channels * self._sample_width
-                                )
-                                if len(raw) < expected_bytes:
-                                    log.warning(
-                                        "REC → mic read short | got=%d expected=%d | padding",
-                                        len(raw), expected_bytes,
-                                    )
-                                    raw = raw + b"\x00" * (expected_bytes - len(raw))
-                                elif len(raw) > expected_bytes:
-                                    log.warning(
-                                        "REC → mic read long | got=%d expected=%d | trimming",
-                                        len(raw), expected_bytes,
-                                    )
-                                    raw = raw[:expected_bytes]
-                                # Stereo-to-mono downmix — mirrors the loopback path
-                                if self._mic_channels == 2:
-                                    samples = struct.unpack(f"<{len(raw)//2}h", raw)
-                                    if len(samples) % 2 != 0:
-                                        samples = samples[:-1]
-                                    mono = [
-                                        max(-32768, min(32767,
-                                            (int(samples[i]) + int(samples[i + 1])) // 2))
-                                        for i in range(0, len(samples), 2)
-                                    ]
-                                    raw = struct.pack(f"<{len(mono)}h", *mono)
-                                if self._actual_sample_rate != self._mix_rate:
-                                    raw = self._resample(
-                                        raw, self._actual_sample_rate, self._mix_rate
-                                    )
-                                # Normalize to exact output chunk size (handles resample rounding)
-                                if len(raw) < _chunk_bytes:
-                                    raw = raw + b"\x00" * (_chunk_bytes - len(raw))
-                                elif len(raw) > _chunk_bytes:
-                                    raw = raw[:_chunk_bytes]
-                                mic_data = raw
-                        except OSError as exc:
-                            if self._stop_event.is_set():
-                                break
-                            log.exception(
-                                "[REC-005] Mic read error | errno=%s", exc.errno
-                            )
-                            try:
-                                mic_stream.stop_stream()
-                                mic_stream.close()
-                            except Exception:
-                                pass
-                            self._stream = None
-                        except Exception:
-                            if self._stop_event.is_set():
-                                break
-                            log.exception("[REC-005] Mic read failed")
-                            self._stream = None
-
-                    # ── Debug stems ───────────────────────────────────────────
-                    # Sources are normalized to exactly _chunk_bytes above.
-                    # Write the normalized mono frames (or silence) per stem.
-                    if self._debug_stems:
-                        if self._loopback_debug_wav is not None:
-                            try:
-                                self._loopback_debug_wav.writeframes(
-                                    loopback_data if loopback_data is not None
-                                    else b"\x00" * _chunk_bytes
-                                )
-                            except Exception:
-                                pass
-                        if self._mic_debug_wav is not None:
-                            try:
-                                self._mic_debug_wav.writeframes(
-                                    mic_data if mic_data is not None
-                                    else b"\x00" * _chunk_bytes
-                                )
-                            except Exception:
-                                pass
-
-                    # ── Normalize: fill missing source with silence ───────────
-                    # Every iteration writes exactly one mono chunk so the WAV
-                    # grows at wall-clock rate regardless of which streams are live.
-                    if loopback_data is None:
-                        loopback_data = b"\x00" * _chunk_bytes
-                    if mic_data is None:
-                        mic_data = b"\x00" * _chunk_bytes
-
-                    # ── Mix ───────────────────────────────────────────────────
-                    count = min(len(loopback_data), len(mic_data)) // 2
-                    lb_s = struct.unpack(f"<{count}h", loopback_data[:count * 2])
-                    mc_s = struct.unpack(f"<{count}h", mic_data[:count * 2])
-                    mixed = [
-                        max(-32768, min(32767, int(lb_s[i]) + int(mc_s[i])))
-                        for i in range(count)
-                    ]
-                    write_data = struct.pack(f"<{count}h", *mixed)
-
-                    # ── Write ─────────────────────────────────────────────────
-                    try:
-                        self._wav_file.writeframes(write_data)
-                        self._bytes_written += len(write_data)
-                    except Exception:
-                        log.exception(
-                            "[REC-005] WAV write error | path=%s | bytes=%s",
-                            self._output_path, self._bytes_written,
-                        )
-                        break
-
-                    # ── Silence detection: check RMS every 3 seconds ──────────
-                    self._silence_buffer.extend(write_data)
-                    check_size = self._mix_rate * 3 * 2
-                    if len(self._silence_buffer) >= check_size:
-                        smp = struct.unpack(
-                            f"<{check_size // 2}h",
-                            bytes(self._silence_buffer[:check_size]),
-                        )
-                        rms = math.sqrt(sum(s * s for s in smp) / len(smp)) if smp else 0.0
-                        if rms < 10:
-                            self._silent_secs += 3
-                            if self._silent_secs >= 6:
-                                log.warning(
-                                    "[REC-009] Recording silent | rms=%.1f | silent=%ds"
-                                    " | streams=loopback:%s mic:%s",
-                                    rms, self._silent_secs,
-                                    "ON" if self._loopback_stream else "OFF",
-                                    "ON" if self._stream else "OFF",
-                                )
-                        else:
-                            if self._silent_secs > 0:
-                                log.info("REC → audio detected | rms=%.1f", rms)
-                            self._silent_secs = 0
-                        self._silence_buffer = bytearray()
-
-                    # ── Writer clock ──────────────────────────────────────────
-                    # Pace each tick to wall-clock rate so the WAV duration
-                    # matches real time regardless of which sources are live.
-                    # When loopback is active its blocking read consumes most of
-                    # _block_seconds; the wait here covers any remaining gap.
-                    # When both streams are gone, the wait IS the pacing.
-                    if lb_stream is None and mic_stream is None:
-                        self._try_reconnect_streams_async()
-                    _elapsed = time.monotonic() - _iter_start
-                    _sleep = _block_seconds - _elapsed
-                    if _sleep > 0:
-                        if self._stop_event.wait(_sleep):
-                            break
-                    elif (_elapsed - _block_seconds) * 1000 > 10:
-                        log.warning(
-                            "[REC-013] writer lag | behind_ms=%.1f",
-                            (_elapsed - _block_seconds) * 1000,
-                        )
-
-                except Exception:
-                    if self._stop_event.is_set():
-                        break
-                    log.exception(
-                        "[REC-004] Record loop error | bytes=%s",
-                        self._bytes_written,
-                    )
-                    break
-
-        finally:
-            self._finalize_wav()
-            self._log_duration_check()
-            log.info("REC → record thread exiting | bytes_written=%s | normal=%s",
-                     self._bytes_written, self._stop_event.is_set())
+    # ── internal: watchdog thread ─────────────────────────────────────────────
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(self._watchdog_interval):
@@ -1427,12 +1637,20 @@ class CaptureEngine:
                 log.exception("[HLT-001] Watchdog iteration failed")
 
     def _trigger_recovery(self) -> None:
+        """
+        Called by watchdog when the writer thread dies.  In the three-thread
+        model the WAV is already finalized by the writer's finally block, so we
+        cannot resume writing to it.  Stop the reader threads and mark recovery
+        exhausted.  Recorder.ensure_recording_alive() will detect is_active==False
+        and create a fresh segment with a new WAV file.
+        """
         with self._lock:
             if self._recovery_exhausted:
                 return
             max_attempts = max(1, RECORDER_WATCHDOG_RECOVERY_ATTEMPTS)
             self._recovery_attempts += 1
             attempt = self._recovery_attempts
+            uptime = int(time.time() - self._thread_started_at) if self._thread_started_at else 0
             if attempt > max_attempts:
                 self._recovery_exhausted = True
                 log.error(
@@ -1440,69 +1658,44 @@ class CaptureEngine:
                 )
                 return
 
-            old_stream = self._stream
-            self._stream = None
+        log.warning(
+            "[HLT-001] Writer thread dead | uptime=%ss | attempt %s/%s"
+            " | stopping readers — Recorder will open new segment",
+            uptime, attempt, max_attempts,
+        )
 
-        if old_stream is not None:
-            try:
-                old_stream.stop_stream()
-            except Exception:
-                log.exception("[REC-004] watchdog: stream.stop_stream failed")
-            try:
-                old_stream.close()
-            except Exception:
-                log.exception("[REC-004] watchdog: stream.close failed")
+        # Stop reader threads (they are still running, draining to a dead queue)
+        self._stop_readers(timeout=2.0)
 
-        device = self._device_manager.select_best_device()
-        if device is None:
-            with self._lock:
-                self._recovery_exhausted = True
-            log.error("[HLT-002] Recovery failed — no input device available")
-            return
-
+        # WAV is gone; flag exhausted so is_active returns False and Recorder
+        # creates a new segment via ensure_recording_alive() → engine.start()
         with self._lock:
-            self._device = device
-            self._device_name = str(device.get("name", "?"))
-            log.warning(
-                "[HLT-001] Thread dead | attempt %s/%s | restarting on %s",
-                attempt, max_attempts, self._device_name,
-            )
+            self._recovery_exhausted = True
+        log.warning("[HLT-001] Recovery: readers stopped — waiting for Recorder new segment")
 
-        if not self._open_stream(device):
-            with self._lock:
-                self._recovery_exhausted = True
-            log.error("[HLT-002] Recovery failed — stream open failed on %s",
-                      self._device_name)
-            return
-
+    def _stop_readers(self, timeout: float = 2.0) -> None:
+        """Mark both source readers offline and join with a bounded timeout."""
         with self._lock:
-            self._thread_started_at = time.time()
-            self._record_thread = threading.Thread(
-                target=self._record_loop,
-                daemon=True,
-                name="CaptureEngineRecord",
-            )
-            self._record_thread.start()
-        log.info("REC → recovery OK | device=%s | attempt=%s",
-                 self._device_name, attempt)
+            lb_reader = self._lb_reader
+            mic_reader = self._mic_reader
+            self._lb_reader = None
+            self._mic_reader = None
+        for reader in (lb_reader, mic_reader):
+            if reader is not None:
+                reader.go_offline()
+        for reader in (lb_reader, mic_reader):
+            if reader is not None:
+                reader.join(timeout=timeout)
+                if reader.is_alive():
+                    log.warning(
+                        "REC → %s still alive after %.1fs — continuing",
+                        reader.name, timeout,
+                    )
 
-        # Try to reopen loopback if it was lost (USB speaker reconnected)
+    def _add_bytes_written(self, n: int) -> None:
+        """Thread-safe bytes_written increment — called by _AudioWriter per chunk."""
         with self._lock:
-            lb = self._loopback_stream
-        if lb is None:
-            new_lb = self._open_loopback_stream()
-            if new_lb:
-                with self._lock:
-                    self._loopback_stream = new_lb
-                log.info(
-                    "REC → recovery: loopback stream reopened"
-                    " (USB speaker back)"
-                )
-            else:
-                log.warning(
-                    "REC → recovery: loopback reopen failed"
-                    " — recording mic-only until next call"
-                )
+            self._bytes_written += n
 
     # ── internal: MP3 conversion ─────────────────────────────────────────────
 

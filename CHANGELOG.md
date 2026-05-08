@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-05-08 — Three-thread audio pipeline refactor
+
+### Root cause fixed
+
+`loopback.read()` in a WASAPI stall blocks for 2+ seconds.  The old
+single `_record_loop` thread did both the blocking read and the WAV write,
+so the WAV fell behind wall clock by the full stall duration.  Confirmed in
+production: `[REC-013] writer lag | behind_ms=2090.0`, WAV ratio=0.63 on a
+19-second call.
+
+### Architecture change
+
+`_record_loop` removed.  Replaced by three independent daemon threads:
+
+| Thread | Class | Owns |
+|--------|-------|------|
+| LoopbackReader | `_SourceReader` | `loopback.read()` — may block 2 s |
+| MicReader | `_SourceReader` | `mic.read()` — blocking in own thread |
+| Writer | `_AudioWriter` | WAV writes; `time.monotonic()` wall-clock scheduling |
+
+Writer wakes at exact `next_tick += block_seconds` intervals (absolute, no drift).
+Pulls from two `deque(maxlen=24)` queues or fills silence if empty.
+Never calls `stream.read()`.
+
+### Other changes in this commit
+
+- `mic_gain=0.75`, `loopback_gain=0.65` config params; float/int32 mix math; clamp to int16
+- Level log every 4s: `REC → levels | mic_rms=... | loopback_rms=... | mixed_rms=... | clipped=... | mic_online=... | loopback_online=...`
+- `[REC-014]` queue overflow code (throttled logging)
+- `on_usb_disconnect()` calls `reader.go_offline()` instead of directly nulling stream refs
+- `_try_reconnect_streams()` calls `reader.set_stream()` to inject reconnected stream into running reader thread
+- `_trigger_recovery()` simplified: stops readers + marks exhausted; Recorder creates new segment
+- `_resample_audio()` promoted to module-level function
+
+### New log patterns
+
+| Pattern | Meaning |
+|---------|---------|
+| `REC → LoopbackReader started` | Loopback reader thread alive |
+| `REC → MicReader started` | Mic reader thread alive |
+| `REC → writer started \| mix_rate=...` | Writer thread alive |
+| `REC → levels \| mic_rms=... \| ...` | Periodic level log from writer |
+| `[REC-013] writer lag \| behind_ms=...` | Writer fell behind (now rare — means CPU stall) |
+| `[REC-014] LoopbackReader queue overflow` | Queue full; oldest frame dropped |
+
+---
+
 ## 2026-05-08 — Direction no-downgrade, USB silence loop, MP3/48 kHz
 
 ### Root causes
