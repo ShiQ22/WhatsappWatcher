@@ -515,6 +515,9 @@ class _SourceReader(threading.Thread):
         # source_block_seconds regardless of the mix-rate target.
         self._source_block_seconds: float = chunk_size / max(1, source_rate)
         self._last_pace_lag_log: float = 0.0
+        # Diagnostic throttle timestamps (not used for audio logic)
+        self._diag_avail_log: float = 0.0   # last time we logged get_read_available
+        self._diag_stereo_log: float = 0.0  # last time we logged stereo channel RMS
 
     # ── stream lifecycle ──────────────────────────────────────────────────────
 
@@ -563,6 +566,19 @@ class _SourceReader(threading.Thread):
 
             iter_start = time.monotonic()
 
+            # ── diagnostic: frames available before blocking read ─────────────
+            now_diag = iter_start
+            if now_diag - self._diag_avail_log >= 4.0:
+                try:
+                    avail = stream.get_read_available()
+                    log.info(
+                        "REC-DIAG → %s pre-read | avail_frames=%d | chunk=%d",
+                        self.name, avail, self._chunk_size,
+                    )
+                except Exception:
+                    pass
+                self._diag_avail_log = now_diag
+
             # ── blocking read ─────────────────────────────────────────────────
             try:
                 raw = stream.read(self._chunk_size, exception_on_overflow=False)
@@ -583,6 +599,14 @@ class _SourceReader(threading.Thread):
                     self._stream = None
                 continue
 
+            # ── diagnostic: log slow reads ────────────────────────────────────
+            read_ms = (time.monotonic() - iter_start) * 1000
+            if read_ms > 50 and read_ms - self._source_block_seconds * 1000 > 50:
+                log.info(
+                    "REC-DIAG → %s slow read | read_ms=%.1f | chunk=%d | rate=%d",
+                    self.name, read_ms, self._chunk_size, self._source_rate,
+                )
+
             # ── validate byte count ───────────────────────────────────────────
             expected = self._chunk_size * src_ch * self._sample_width
             if len(raw) < expected:
@@ -600,6 +624,28 @@ class _SourceReader(threading.Thread):
                     for i in range(0, len(samples), 2)
                 ]
                 raw = struct.pack(f"<{len(mono)}h", *mono)
+
+                # ── diagnostic: per-channel RMS + correlation (throttled) ─────
+                now_s = time.monotonic()
+                if now_s - self._diag_stereo_log >= 4.0:
+                    L = samples[0::2]
+                    R = samples[1::2]
+                    n = max(1, len(L))
+                    l_rms = math.sqrt(sum(int(v) * int(v) for v in L) / n)
+                    r_rms = math.sqrt(sum(int(v) * int(v) for v in R) / n)
+                    mix_rms = math.sqrt(sum(int(mono[i]) * int(mono[i]) for i in range(len(mono))) / max(1, len(mono)))
+                    # Pearson-like correlation (sign only, unnormalized)
+                    if l_rms > 0 and r_rms > 0:
+                        cov = sum(int(L[i]) * int(R[i]) for i in range(n)) / n
+                        corr = cov / (l_rms * r_rms)
+                    else:
+                        corr = 0.0
+                    log.info(
+                        "REC-DIAG → %s stereo | L_rms=%.1f | R_rms=%.1f"
+                        " | mix_rms=%.1f | LR_corr=%.3f",
+                        self.name, l_rms, r_rms, mix_rms, corr,
+                    )
+                    self._diag_stereo_log = now_s
 
             # ── resample ──────────────────────────────────────────────────────
             if src_rate != self._mix_rate:
@@ -1440,6 +1486,26 @@ class CaptureEngine:
                         "REC → reconnect skipped; source still unavailable"
                         " — no real mic found, mic stays offline"
                     )
+                    # Diagnostic: fresh PyAudio snapshot to see if USB returned
+                    try:
+                        _pa_fresh = pyaudio.PyAudio()
+                        _n = _pa_fresh.get_device_count()
+                        log.info("REC-DIAG → fresh PyAudio snapshot | device_count=%d", _n)
+                        for _i in range(_n):
+                            try:
+                                _d = _pa_fresh.get_device_info_by_index(_i)
+                                if int(_d.get("maxInputChannels", 0)) > 0:
+                                    log.info(
+                                        "REC-DIAG → fresh INPUT idx=%d | %s | in=%d | rate=%d",
+                                        _i, _d.get("name", "?"),
+                                        int(_d.get("maxInputChannels", 0)),
+                                        int(_d.get("defaultSampleRate", 0)),
+                                    )
+                            except Exception:
+                                pass
+                        _pa_fresh.terminate()
+                    except Exception:
+                        log.exception("REC-DIAG → fresh PyAudio snapshot failed")
                 else:
                     dev_name = str(device.get("name", "?"))
                     with self._lock:
