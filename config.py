@@ -45,6 +45,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "keep_temp": False,
         "startup_timeout_seconds": 10.0,
         "stop_timeout_seconds": 120.0,
+        "ffmpeg_path": "bin/ffmpeg.exe",
+        "keep_wav_after_mp3": False,
     },
     "watcher": {
         "poll_interval_seconds": 0.8,
@@ -220,6 +222,20 @@ RECORDER_HELPER_STOP_TIMEOUT: float = float(
 )
 RECORDER_HELPER_KEEP_TEMP: bool = bool(
     RECORDER.get("keep_temp", _recorder_defaults.get("keep_temp", False))
+)
+
+# FFmpeg post-processing — WAV→MP3 conversion after RecorderHelper produces output
+_raw_ffmpeg_path: str = str(
+    RECORDER.get("ffmpeg_path", _recorder_defaults.get("ffmpeg_path", "bin/ffmpeg.exe"))
+    or "bin/ffmpeg.exe"
+)
+RECORDER_FFMPEG_PATH: str = (
+    _raw_ffmpeg_path
+    if Path(_raw_ffmpeg_path).is_absolute()
+    else str((BASE_DIR / _raw_ffmpeg_path).resolve())
+)
+RECORDER_KEEP_WAV_AFTER_MP3: bool = bool(
+    RECORDER.get("keep_wav_after_mp3", _recorder_defaults.get("keep_wav_after_mp3", False))
 )
 
 # Backwards compatibility aliases — kept so frozen modules (main.py et al.) keep importing.

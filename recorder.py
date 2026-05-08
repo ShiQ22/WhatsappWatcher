@@ -45,6 +45,8 @@ from config import (
     RECORDER_HELPER_STARTUP_TIMEOUT,
     RECORDER_HELPER_STOP_TIMEOUT,
     RECORDER_HELPER_KEEP_TEMP,
+    RECORDER_FFMPEG_PATH,
+    RECORDER_KEEP_WAV_AFTER_MP3,
 )
 
 log = logging.getLogger("watcher.recorder")
@@ -2999,9 +3001,93 @@ class Recorder:
                 self._recording_issues = "[RH-006]"
             return []
 
-        with self._lock:
-            self._recording_success = True
-        return [path]
+        # Format branching — applies only to helper backend WAV output.
+        # PyAudio backend has its own conversion path via CaptureEngine.convert_to_mp3().
+        fmt = RECORDER_FORMAT
+        if fmt == "mp3":
+            mp3 = self._convert_wav_to_mp3(path)
+            if mp3:
+                if not RECORDER_KEEP_WAV_AFTER_MP3:
+                    try:
+                        Path(path).unlink()
+                    except Exception:
+                        log.exception("[RH-MP3-005] WAV delete failed after MP3 | path=%s", path)
+                with self._lock:
+                    self._recording_success = True
+                return [mp3]
+            else:
+                log.warning("[RH-MP3] Conversion failed — keeping WAV | path=%s", path)
+                with self._lock:
+                    self._recording_success = True
+                return [path]
+        elif fmt == "both":
+            # Returns [wav, mp3] — both are uploaded/processed.
+            # WAV is first to match the existing pyaudio "both" ordering.
+            mp3 = self._convert_wav_to_mp3(path)
+            if mp3:
+                with self._lock:
+                    self._recording_success = True
+                return [path, mp3]
+            else:
+                log.warning("[RH-MP3] Conversion failed — returning WAV only | path=%s", path)
+                with self._lock:
+                    self._recording_success = True
+                return [path]
+        else:  # "wav"
+            with self._lock:
+                self._recording_success = True
+            return [path]
+
+    def _convert_wav_to_mp3(self, wav_path: str) -> Optional[str]:
+        """Convert a WAV file to MP3 using FFmpeg. Returns mp3_path on success, None on failure."""
+        wav = Path(wav_path)
+        if not wav.exists() or wav.stat().st_size == 0:
+            log.error("[RH-MP3-001] WAV missing or empty before conversion | path=%s", wav_path)
+            return None
+
+        ffmpeg = Path(RECORDER_FFMPEG_PATH)
+        if not ffmpeg.exists():
+            log.error("[RH-MP3-001] ffmpeg.exe not found | path=%s", ffmpeg)
+            return None
+
+        mp3_path = str(wav.with_suffix(".mp3"))
+        log.info("[RH-MP3] Converting WAV to MP3 | wav=%s | bitrate=%sk",
+                 wav_path, RECORDER_MP3_BITRATE)
+
+        try:
+            result = subprocess.run(
+                [
+                    str(ffmpeg), "-y",
+                    "-i", wav_path,
+                    "-ab", f"{RECORDER_MP3_BITRATE}k",
+                    "-ac", "1",
+                    "-ar", "48000",
+                    mp3_path,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            log.exception("[RH-MP3-004] Exception running ffmpeg | wav=%s", wav_path)
+            return None
+
+        if result.returncode != 0:
+            stderr_tail = "\n".join(result.stderr.splitlines()[-10:])
+            log.error(
+                "[RH-MP3-002] ffmpeg failed | exit=%d | wav=%s\n%s",
+                result.returncode, wav_path, stderr_tail,
+            )
+            return None
+
+        mp3 = Path(mp3_path)
+        if not mp3.exists() or mp3.stat().st_size == 0:
+            log.error("[RH-MP3-003] MP3 missing or empty after conversion | path=%s", mp3_path)
+            return None
+
+        log.info("[RH-MP3] MP3 created | path=%s | size=%d bytes", mp3_path, mp3.stat().st_size)
+        return mp3_path
 
     def _ensure_recording_alive_helper(self) -> bool:
         with self._lock:

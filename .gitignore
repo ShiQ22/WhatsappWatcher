@@ -17,6 +17,9 @@ dist/
 build/
 *.spec.bak
 
+# bundled binaries — never commit
+bin/*.exe
+
 # python cache
 __pycache__/
 *.pyc
