@@ -34,6 +34,7 @@ from config import (
     RECORDER_DEVICE_RETRY_DELAY_SECONDS,
     RECORDER_WATCHDOG_RECOVERY_ATTEMPTS,
     RECORDER_POLLING_FALLBACK_INTERVAL_SECONDS,
+    RECORDER_DEBUG_STEMS,
 )
 
 log = logging.getLogger("watcher.recorder")
@@ -426,6 +427,18 @@ class CaptureEngine:
         self._reconnect_thread: Optional[threading.Thread] = None
         self._last_reconnect_attempt_ts: float = 0.0
 
+        # Actual channel count the mic stream was opened with (1 or 2).
+        # Set by _open_stream(); independent of the output WAV channel count.
+        self._mic_channels: int = 1
+
+        # Debug stem WAV files — written only when config debug_stems=true.
+        # Never uploaded, never indexed in DB, not auto-deleted.
+        self._debug_stems: bool = RECORDER_DEBUG_STEMS
+        self._mic_debug_wav: Optional[wave.Wave_write] = None
+        self._loopback_debug_wav: Optional[wave.Wave_write] = None
+        self._mic_debug_path: Optional[str] = None
+        self._loopback_debug_path: Optional[str] = None
+
     # ── public API ───────────────────────────────────────────────────────────
 
     @property
@@ -473,6 +486,11 @@ class CaptureEngine:
             self._device_name = str(device.get("name", "?")) if device else ""
             self._silence_buffer = bytearray()
             self._silent_secs = 0
+            self._mic_channels = 1
+            self._mic_debug_wav = None
+            self._loopback_debug_wav = None
+            self._mic_debug_path = None
+            self._loopback_debug_path = None
 
             # Open WASAPI loopback (captures incoming voice / system audio)
             self._loopback_stream = self._open_loopback_stream()
@@ -520,6 +538,15 @@ class CaptureEngine:
                     "REC → WAV framerate corrected | actual=%sHz | config=%sHz",
                     self._mix_rate, self._sample_rate,
                 )
+
+            # Open per-stem debug WAV files (mix_rate now final).
+            # These are diagnostic only: not uploaded, no DB rows, not auto-deleted.
+            if self._debug_stems:
+                stem = str(Path(output_path).with_suffix(""))
+                self._mic_debug_path = stem + "_mic_debug.wav"
+                self._loopback_debug_path = stem + "_loopback_debug.wav"
+                self._mic_debug_wav = self._open_debug_wav(self._mic_debug_path)
+                self._loopback_debug_wav = self._open_debug_wav(self._loopback_debug_path)
 
             streams_active = []
             if self._loopback_stream:
@@ -854,23 +881,30 @@ class CaptureEngine:
         retry_count = max(1, RECORDER_DEVICE_RETRY_COUNT)
         delay = max(0.0, RECORDER_DEVICE_RETRY_DELAY_SECONDS)
 
-        # Query the device's native sample rate so we can fall back to it if the
-        # configured rate is rejected with errno -9997 (Invalid sample rate).
+        # Query the device's native sample rate and max input channels BEFORE
+        # opening, so we can try the hardware's preferred channel count first.
         native_rate = self._sample_rate
+        max_input_channels = 1
         if device_index is not None:
             try:
                 info = pa.get_device_info_by_index(device_index)
                 queried = int(info.get("defaultSampleRate", 0) or 0)
                 if queried > 0:
                     native_rate = queried
+                max_input_channels = int(info.get("maxInputChannels", 1) or 1)
             except Exception:
                 pass
 
+        # Prefer opening the mic as stereo (2ch) when the device supports it.
+        # We downmix to mono in the record loop, matching the loopback path.
+        # If 2ch open fails, fall back to mono (1ch).
+        channels_to_try = [2, 1] if max_input_channels >= 2 else [1]
+
         # Build a prioritised, deduped list of sample rates to try.
         rates_to_try = list(dict.fromkeys([
-            self._sample_rate,  # configured rate — always try first
-            native_rate,        # device native rate (may differ from config)
-            48000,              # common WASAPI default
+            self._sample_rate,
+            native_rate,
+            48000,
             44100,
             22050,
             16000,
@@ -881,101 +915,103 @@ class CaptureEngine:
             if self._stop_event.is_set():
                 break
 
-            attempt = 0
-            while attempt < retry_count:
-                attempt += 1
-                try:
-                    stream = pa.open(
-                        format=self._pa_format(),
-                        channels=self._channels,
-                        rate=rate,
-                        input=True,
-                        input_device_index=device_index,
-                        frames_per_buffer=self._chunk_size,
-                    )
-                    self._stream = stream
-                    self._actual_sample_rate = rate
-                    if device_name not in self._tried_devices:
-                        self._tried_devices.append(device_name)
-                    log.info(
-                        "REC → stream opened | rate=%sHz | device=%s | api=%s",
-                        rate, device_name, api_name,
-                    )
-                    if rate != self._sample_rate:
-                        log.info(
-                            "REC → config rate=%sHz not supported, using %sHz (device native)",
-                            self._sample_rate, rate,
-                        )
-
-                    # 0.5-second probe read — diagnose silent mic without blocking recording
+            for ch in channels_to_try:
+                attempt = 0
+                while attempt < retry_count:
+                    attempt += 1
                     try:
-                        probe_frames = min(int(self._actual_sample_rate * 0.5),
-                                           self._chunk_size * 4)
-                        probe_data = stream.read(probe_frames, exception_on_overflow=False)
-                        probe_samples = struct.unpack(f"<{len(probe_data) // 2}h", probe_data)
-                        probe_rms = (
-                            math.sqrt(sum(s * s for s in probe_samples) / len(probe_samples))
-                            if probe_samples else 0.0
+                        stream = pa.open(
+                            format=self._pa_format(),
+                            channels=ch,
+                            rate=rate,
+                            input=True,
+                            input_device_index=device_index,
+                            frames_per_buffer=self._chunk_size,
                         )
-                        if probe_rms < 1.0:
-                            log.warning(
-                                "REC → mic probe silent | rms=%.1f | device=%s | "
-                                "possible causes: mic volume=0 in Windows Sound settings, "
-                                "no physical mic connected, or exclusive-mode conflict",
-                                probe_rms, device_name,
-                            )
-                        else:
+                        self._stream = stream
+                        self._mic_channels = ch
+                        self._actual_sample_rate = rate
+                        if device_name not in self._tried_devices:
+                            self._tried_devices.append(device_name)
+                        log.info(
+                            "REC → stream opened | rate=%sHz | channels=%s | device=%s | api=%s",
+                            rate, ch, device_name, api_name,
+                        )
+                        if ch == 1 and max_input_channels >= 2:
                             log.info(
-                                "REC → mic probe OK | rms=%.1f | device=%s",
-                                probe_rms, device_name,
+                                "REC → mic 2-ch open failed for rate=%sHz"
+                                " — opened 1-ch fallback | device=%s",
+                                rate, device_name,
                             )
+                        if rate != self._sample_rate:
+                            log.info(
+                                "REC → config rate=%sHz not supported, using %sHz (device native)",
+                                self._sample_rate, rate,
+                            )
+
+                        # 0.5-second probe read — diagnose silent mic without blocking recording
+                        try:
+                            probe_frames = min(int(self._actual_sample_rate * 0.5),
+                                               self._chunk_size * 4)
+                            probe_data = stream.read(probe_frames, exception_on_overflow=False)
+                            probe_samples = struct.unpack(f"<{len(probe_data) // 2}h", probe_data)
+                            probe_rms = (
+                                math.sqrt(sum(s * s for s in probe_samples) / len(probe_samples))
+                                if probe_samples else 0.0
+                            )
+                            if probe_rms < 1.0:
+                                log.warning(
+                                    "REC → mic probe silent | rms=%.1f | channels=%s | device=%s | "
+                                    "possible causes: mic volume=0, no physical mic, or exclusive-mode conflict",
+                                    probe_rms, ch, device_name,
+                                )
+                            else:
+                                log.info(
+                                    "REC → mic probe OK | rms=%.1f | channels=%s | device=%s",
+                                    probe_rms, ch, device_name,
+                                )
+                        except Exception:
+                            log.exception(
+                                "[REC-002] Mic probe read failed | device=%s", device_name
+                            )
+
+                        return True
+
+                    except OSError as exc:
+                        errno_val = exc.args[0] if exc.args else 0
+                        if errno_val == -9997:
+                            log.warning(
+                                "REC → rate %sHz ch=%s rejected (invalid sample rate)"
+                                " | device=%s — trying next",
+                                rate, ch, device_name,
+                            )
+                            break  # skip to next ch (or next rate when ch list exhausted)
+                        if errno_val == -9992:
+                            log.warning(
+                                "[REC-002] PortAudio insufficient memory (errno -9992)"
+                                " on %s — reinitializing PyAudio and retrying",
+                                device_name,
+                            )
+                            self._device_manager.reinit_pyaudio()
+                            pa = self._device_manager._pa
+                            if pa is None:
+                                break
+                            continue
+                        log.exception(
+                            "[REC-002] [attempt %s/%s] Stream open failed: %s",
+                            attempt, retry_count, device_name,
+                        )
+                        if attempt < retry_count and delay > 0:
+                            if self._stop_event.wait(delay):
+                                break
                     except Exception:
                         log.exception(
-                            "[REC-002] Mic probe read failed | device=%s", device_name
+                            "[REC-002] [attempt %s/%s] Stream open failed: %s",
+                            attempt, retry_count, device_name,
                         )
-                        # Do not close stream — probe failure is non-fatal
-
-                    return True
-                except OSError as exc:
-                    errno_val = exc.args[0] if exc.args else 0
-                    if errno_val == -9997:
-                        # Invalid sample rate — this rate will never work; try the next one.
-                        log.warning(
-                            "REC → rate %sHz rejected by device=%s (invalid sample rate)"
-                            " — trying next",
-                            rate, device_name,
-                        )
-                        break  # skip to next rate immediately
-                    if errno_val == -9992:
-                        # PortAudio insufficient memory — stale state.
-                        # Reinitialize PyAudio and retry this rate once.
-                        log.warning(
-                            "[REC-002] PortAudio insufficient memory (errno -9992)"
-                            " on %s — reinitializing PyAudio and retrying",
-                            device_name,
-                        )
-                        self._device_manager.reinit_pyaudio()
-                        # Update pa reference after reinit
-                        pa = self._device_manager._pa
-                        if pa is None:
-                            break
-                        continue  # retry same rate with fresh PyAudio
-                    # Any other OS error — retry up to retry_count times.
-                    log.exception(
-                        "[REC-002] [attempt %s/%s] Stream open failed: %s",
-                        attempt, retry_count, device_name,
-                    )
-                    if attempt < retry_count and delay > 0:
-                        if self._stop_event.wait(delay):
-                            break
-                except Exception:
-                    log.exception(
-                        "[REC-002] [attempt %s/%s] Stream open failed: %s",
-                        attempt, retry_count, device_name,
-                    )
-                    if attempt < retry_count and delay > 0:
-                        if self._stop_event.wait(delay):
-                            break
+                        if attempt < retry_count and delay > 0:
+                            if self._stop_event.wait(delay):
+                                break
 
         if device_name not in self._tried_devices:
             self._tried_devices.append(device_name)
@@ -1060,6 +1096,19 @@ class CaptureEngine:
             log.exception("[REC-002] Loopback stream failed — will use microphone only")
             return None
 
+    def _open_debug_wav(self, path: str) -> Optional[wave.Wave_write]:
+        """Open a mono 16-bit WAV for per-stem debug output. Errors are non-fatal."""
+        try:
+            w = wave.open(path, 'wb')
+            w.setnchannels(1)
+            w.setsampwidth(self._sample_width)
+            w.setframerate(self._mix_rate)
+            log.info("REC → debug stem opened | path=%s", path)
+            return w
+        except Exception:
+            log.exception("REC → debug stem open failed | path=%s", path)
+            return None
+
     @staticmethod
     def _resample(data: bytes, from_rate: int, to_rate: int) -> bytes:
         """Nearest-neighbour resample — adequate quality for voice."""
@@ -1089,6 +1138,16 @@ class CaptureEngine:
                           self._output_path, self._bytes_written)
         finally:
             self._wav_file = None
+
+        # Close debug stems alongside the main WAV
+        for dbg_wav in (self._mic_debug_wav, self._loopback_debug_wav):
+            if dbg_wav is not None:
+                try:
+                    dbg_wav.close()
+                except Exception:
+                    pass
+        self._mic_debug_wav = None
+        self._loopback_debug_wav = None
 
     def _log_duration_check(self) -> None:
         """Log a ratio of WAV duration vs wall-clock duration. Warns on mismatch."""
@@ -1181,6 +1240,33 @@ class CaptureEngine:
                                     self._chunk_size,
                                     exception_on_overflow=False,
                                 )
+                                # Validate: expected bytes = chunk_size × channels × width
+                                expected_bytes = (
+                                    self._chunk_size * self._mic_channels * self._sample_width
+                                )
+                                if len(raw) < expected_bytes:
+                                    log.warning(
+                                        "REC → mic read short | got=%d expected=%d | padding",
+                                        len(raw), expected_bytes,
+                                    )
+                                    raw = raw + b"\x00" * (expected_bytes - len(raw))
+                                elif len(raw) > expected_bytes:
+                                    log.warning(
+                                        "REC → mic read long | got=%d expected=%d | trimming",
+                                        len(raw), expected_bytes,
+                                    )
+                                    raw = raw[:expected_bytes]
+                                # Stereo-to-mono downmix — mirrors the loopback path
+                                if self._mic_channels == 2:
+                                    samples = struct.unpack(f"<{len(raw)//2}h", raw)
+                                    if len(samples) % 2 != 0:
+                                        samples = samples[:-1]
+                                    mono = [
+                                        max(-32768, min(32767,
+                                            (int(samples[i]) + int(samples[i + 1])) // 2))
+                                        for i in range(0, len(samples), 2)
+                                    ]
+                                    raw = struct.pack(f"<{len(mono)}h", *mono)
                                 if self._actual_sample_rate != self._mix_rate:
                                     raw = self._resample(
                                         raw, self._actual_sample_rate, self._mix_rate
@@ -1204,35 +1290,46 @@ class CaptureEngine:
                             log.exception("[REC-005] Mic read failed")
                             self._stream = None
 
-                    # ── Both streams gone: write silence + wait for reconnect ────
-                    if self._loopback_stream is None and self._stream is None:
-                        silence = b"\x00" * (self._chunk_size * self._sample_width)
-                        try:
-                            self._wav_file.writeframes(silence)
-                            self._bytes_written += len(silence)
-                        except Exception:
-                            log.exception("[REC-004] WAV silence write failed — exiting record loop")
-                            break
-                        self._try_reconnect_streams_async()
-                        time.sleep(max(0.005, self._chunk_size / max(1, self._mix_rate)))
-                        continue
+                    # ── Debug stems ───────────────────────────────────────────
+                    # Write post-downmix mono frames (or silence) to per-stem files.
+                    # Done before normalization so stems reflect actual captured data.
+                    if self._debug_stems:
+                        _stem_bytes = self._chunk_size * self._sample_width
+                        if self._loopback_debug_wav is not None:
+                            try:
+                                self._loopback_debug_wav.writeframes(
+                                    loopback_data if loopback_data is not None
+                                    else b"\x00" * _stem_bytes
+                                )
+                            except Exception:
+                                pass
+                        if self._mic_debug_wav is not None:
+                            try:
+                                self._mic_debug_wav.writeframes(
+                                    mic_data if mic_data is not None
+                                    else b"\x00" * _stem_bytes
+                                )
+                            except Exception:
+                                pass
+
+                    # ── Normalize: fill missing source with silence ───────────
+                    # Every iteration writes exactly one mono chunk so the WAV
+                    # grows at wall-clock rate regardless of which streams are live.
+                    _chunk_bytes = self._chunk_size * self._sample_width
+                    if loopback_data is None:
+                        loopback_data = b"\x00" * _chunk_bytes
+                    if mic_data is None:
+                        mic_data = b"\x00" * _chunk_bytes
 
                     # ── Mix ───────────────────────────────────────────────────
-                    if loopback_data and mic_data:
-                        count = min(len(loopback_data), len(mic_data)) // 2
-                        lb_s = struct.unpack(f"<{count}h", loopback_data[:count * 2])
-                        mc_s = struct.unpack(f"<{count}h", mic_data[:count * 2])
-                        mixed = [
-                            max(-32768, min(32767, int(lb_s[i]) + int(mc_s[i])))
-                            for i in range(count)
-                        ]
-                        write_data = struct.pack(f"<{count}h", *mixed)
-                    elif loopback_data:
-                        write_data = loopback_data
-                    elif mic_data:
-                        write_data = mic_data
-                    else:
-                        continue
+                    count = min(len(loopback_data), len(mic_data)) // 2
+                    lb_s = struct.unpack(f"<{count}h", loopback_data[:count * 2])
+                    mc_s = struct.unpack(f"<{count}h", mic_data[:count * 2])
+                    mixed = [
+                        max(-32768, min(32767, int(lb_s[i]) + int(mc_s[i])))
+                        for i in range(count)
+                    ]
+                    write_data = struct.pack(f"<{count}h", *mixed)
 
                     # ── Write ─────────────────────────────────────────────────
                     try:
@@ -1269,6 +1366,13 @@ class CaptureEngine:
                                 log.info("REC → audio detected | rms=%.1f", rms)
                             self._silent_secs = 0
                         self._silence_buffer = bytearray()
+
+                    # ── Pace the loop when no live streams ────────────────────
+                    # Prevents CPU spin while waiting for USB reconnect.
+                    # Must come after the WAV write so silence is committed first.
+                    if lb_stream is None and mic_stream is None:
+                        self._try_reconnect_streams_async()
+                        time.sleep(max(0.005, self._chunk_size / max(1, self._mix_rate)))
 
                 except Exception:
                     if self._stop_event.is_set():
