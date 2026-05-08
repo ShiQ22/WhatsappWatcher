@@ -312,6 +312,11 @@ def _queue_closed_daily_reports(
     else:
         log.debug("REPORTER → no closed daily reports to queue")
 
+def _is_debug_stem(path: Path) -> bool:
+    name = path.name
+    return name.endswith("_mic_debug.wav") or name.endswith("_loopback_debug.wav")
+
+
 def _list_recoverable_recording_files(recorder: Recorder) -> list[Path]:
     try:
         recorder.refresh_bandicam_paths()
@@ -324,6 +329,8 @@ def _list_recoverable_recording_files(recorder: Recorder) -> list[Path]:
             if not item.is_file():
                 continue
             if item.suffix.lower() not in ALLOWED_MEDIA_EXTENSIONS:
+                continue
+            if _is_debug_stem(item):
                 continue
             files.append(item)
 
@@ -350,6 +357,8 @@ def _recover_orphan_seg_files(recorder: Recorder, storage: Storage) -> int:
 
         recovered = 0
         for seg_file in output_dir.glob("*_seg1.wav"):
+            if _is_debug_stem(seg_file):
+                continue
             try:
                 log.info("RECOVERY → found orphan seg file: %s", seg_file.name)
 
@@ -635,6 +644,8 @@ def _recover_unfinalized_seg_files(
         now = time.time()
 
         for seg_file in output_dir.glob("*_seg1.wav"):
+            if _is_debug_stem(seg_file):
+                continue
             try:
                 # Skip files touched in last 60s — may be actively recording
                 try:

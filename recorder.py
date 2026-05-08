@@ -604,8 +604,8 @@ class _AudioWriter(threading.Thread):
                 lb_data = self._lb_queue.popleft() if self._lb_queue else silence
                 mic_data = self._mic_queue.popleft() if self._mic_queue else silence
 
-                # ── reconnect trigger when both sources offline ────────────────
-                if (not self._lb_reader.is_online and not self._mic_reader.is_online
+                # ── reconnect trigger when either source is offline ───────────
+                if ((not self._lb_reader.is_online or not self._mic_reader.is_online)
                         and self._reconnect_fn is not None):
                     self._reconnect_fn()  # internally throttled to 2s
 
@@ -1197,12 +1197,24 @@ class CaptureEngine:
                 return
 
             # 2. Under lock: check stop and determine what is actually missing.
-            #    Do this BEFORE reinit so we don't disturb live streams.
+            #    Prefer reader.is_online because a reader can mark itself offline
+            #    on a read failure while CaptureEngine may still hold the old
+            #    stream reference.  Fall back to stream refs when no reader exists.
             with self._lock:
                 if self._stop_event.is_set():
                     return
-                need_lb = self._loopback_stream is None
-                need_mic = self._stream is None
+                lb_reader_ref = self._lb_reader
+                mic_reader_ref = self._mic_reader
+                need_lb = (
+                    not lb_reader_ref.is_online
+                    if lb_reader_ref is not None
+                    else self._loopback_stream is None
+                )
+                need_mic = (
+                    not mic_reader_ref.is_online
+                    if mic_reader_ref is not None
+                    else self._stream is None
+                )
 
             if not need_lb and not need_mic:
                 log.info("REC → reconnect skipped; streams already active")
