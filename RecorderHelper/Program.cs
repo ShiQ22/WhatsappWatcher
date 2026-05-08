@@ -15,6 +15,7 @@ return args[0] switch
 {
     "--list-devices" => ListDevicesCommand.Run(settings),
     "--record-test"  => RecordTestCommand.Run(args, settings),
+    "--ipc"          => IpcCommand.Run(settings),
     _                => UnknownCommand(args[0])
 };
 
@@ -48,6 +49,7 @@ static void PrintUsage()
     Console.WriteLine("Usage:");
     Console.WriteLine("  RecorderHelper.exe --list-devices");
     Console.WriteLine("  RecorderHelper.exe --record-test [--seconds N] [--output-dir PATH]");
+    Console.WriteLine("  RecorderHelper.exe --ipc");
 }
 
 static int UnknownCommand(string cmd)
