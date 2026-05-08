@@ -1,226 +1,289 @@
-# Skill: Audio capture + WAV/MP3 output
+# Skill: Audio capture — FFmpeg backend (production direction)
 
-## Three-thread capture architecture (current as of 2026-05-08 rev3)
+## Status
 
-`_record_loop` has been removed. CaptureEngine now uses three independent threads:
+**The PyAudio three-thread capture architecture described in earlier versions of this file
+has been rejected for production use.**
 
-| Thread | Class | Role |
-|--------|-------|------|
-| LoopbackReader | `_SourceReader` | Non-blocking-poll read for WASAPI loopback |
-| MicReader | `_SourceReader` | Non-blocking-poll read for mic; per-second L/R channel analysis |
-| Writer | `_AudioWriter` | `time.monotonic()` wall-clock scheduling; WAV writes; never calls `stream.read()` |
+The FFmpeg subprocess backend is the approved production direction as of 2026-05-08.
+PyAudio may remain for device enumeration/scoring only.
 
-The writer thread is stored in `_record_thread` for watchdog compatibility.
+See `CLAUDE.md` and `changes/ffmpeg-backend-migration-2026-05-08.md` for the full decision
+and implementation plan.
 
-### Why three threads
+---
 
-`loopback.read()` can block for 2+ seconds on a WASAPI stall. When the reader and writer shared one thread, the WAV grew at ~0.63× wall-clock rate (confirmed: `[REC-013] writer lag | behind_ms=2090.0`). Separate threads let the writer schedule at exact 20ms intervals regardless of source read timing.
+## Production direction: FFmpeg backend
 
-### Why non-blocking readers (rev3)
+### Architecture overview
 
-Blocking `stream.read(chunk)` takes exactly `chunk_seconds` to return when the buffer is freshly drained. `sleep_for = chunk_seconds - elapsed ≈ 0` → immediate re-read → WASAPI ring buffer just drained → blocks again for another full period → alternating real/silence frames. Confirmed: 92-93% of active audio runs ≤ 40ms in both sources. Non-blocking poll loop with `get_read_available()` eliminates this by waiting up to the chunk budget before reading, or pushing silence on timeout.
+```
+Recorder (public API — unchanged interface)
+    └── FFmpegCaptureEngine
+            ├── DeviceResolver          ← runtime device discovery via ffmpeg -list_devices
+            ├── FFmpeg subprocess(es)   ← capture, mix, encode (FFmpeg owns audio I/O)
+            ├── StderrDrainThread       ← daemon thread; drains stderr so FFmpeg never blocks
+            ├── ProcessWatchdog         ← detects FFmpeg process death
+            ├── FileGrowthMonitor       ← detects FFmpeg stall (file not growing)
+            └── USBRecoveryLoop         ← segment close on unplug, new segment on replug
+    └── SegmentMerger (called by resolve_final_files)
+            ├── gap calculation         ← time.monotonic() segment gaps
+            ├── silence WAV generation  ← fills USB unplug gap if configured
+            ├── concat list builder     ← ffmpeg -f concat
+            ├── concat copy attempt     ← ffmpeg -c copy (lossless)
+            └── re-encode fallback      ← ffmpeg re-encode if copy fails
+```
 
-## _JitterBuffer
+### Why FFmpeg
 
-Thread-safe FIFO buffer shared between one `_SourceReader` and `_AudioWriter`. Replaces `_FrameBuffer`.
+- FFmpeg owns the WASAPI audio I/O entirely — no manual PCM read/mix/write in Python.
+- FFmpeg handles buffering, resampling, mixing, and encoding without Python thread timing.
+- FFmpeg's `-f wasapi` input uses the OS audio stack correctly.
+- Debug via FFmpeg stderr — no debug stem WAV files needed in production.
+
+---
+
+## DeviceResolver
+
+Discovers WASAPI device names at runtime on the local PC.
+
+```
+ffmpeg -list_devices true -f wasapi -i dummy 2>&1
+```
+
+Parses output to extract available WASAPI device names.
+Optionally uses PyAudio for scoring (USB bonus, name matching) to pick best mic.
+Returns `ResolvedDevices(loopback_name, mic_name, mode)` where mode is `dual`/`loopback`/`mic`.
+
+**Rules:**
+- Use FFmpeg's exact device name strings for FFmpeg `-i` arguments.
+- Do not use PyAudio device names directly as FFmpeg inputs.
+- Do not hardcode device names.
+- Do not share device names between PCs — each PC discovers its own at runtime.
+- If no real mic: mode = `loopback`; mic input omitted from FFmpeg command.
+- Never use a `[Loopback]` device as the mic input.
+
+---
+
+## FFmpegCaptureEngine
+
+Manages one FFmpeg subprocess per recording segment.
+
+### Start (single segment)
 
 ```python
-buf = _JitterBuffer(maxlen=4, source_name="LoopbackReader")
-buf.push(frame)          # drops oldest + logs [REC-014] (throttled 1s) on overflow
-frame, status = buf.pop_or_hold(source_online, last_frame, silence)
-# status: "ok" | "hold" | "offline"
-# "hold": buffer empty but source online — returns last_frame (up to MAX_HOLD=1 tick)
-# "offline": source offline — returns silence
+# Example dual-source command (exact flags confirmed with bundled ffmpeg build)
+ffmpeg_cmd = [
+    "bin/ffmpeg.exe",
+    "-f", "wasapi", "-i", loopback_device_name,
+    "-f", "wasapi", "-i", mic_device_name,
+    "-filter_complex", "amix=inputs=2:duration=first:dropout_transition=3",
+    "-c:a", "libmp3lame", "-b:a", "64k",
+    "-y", output_segment_path,
+]
 ```
 
-FIFO (oldest-first) maintains audio continuity. MAX_HOLD=1 means after 1 tick of underrun
-the writer switches to silence rather than repeating stale audio.
+- FFmpeg command is a placeholder until confirmed with the exact bundled binary.
+- Stderr must be drained in a daemon thread (`StderrDrainThread`) immediately after
+  subprocess start so FFmpeg never blocks on stderr pipe overflow.
 
-## _SourceReader
+### Stop (end of segment)
+
+Send `SIGTERM` to the FFmpeg subprocess (or write `q\n` to stdin if FFmpeg is started
+with `-stdin`). Wait for process to exit. Save the segment path + end timestamp.
+
+Never use `kill()` as first stop attempt — FFmpeg needs to finalize the output file.
+
+---
+
+## ProcessWatchdog
+
+Monitors the FFmpeg subprocess in a daemon thread.
+
+- Polls `subprocess.poll()` every N seconds.
+- If process died unexpectedly: log error, mark segment complete (partial), trigger
+  `USBRecoveryLoop` or start new segment depending on context.
+
+---
+
+## FileGrowthMonitor
+
+Monitors output segment file size in a daemon thread.
+
+- Records file size every `ffmpeg_stall_threshold_seconds / 2` seconds.
+- If file size has not grown for `ffmpeg_stall_threshold_seconds`: FFmpeg has stalled.
+- On stall: kill process, mark segment complete (partial), start new segment.
+
+---
+
+## USBRecoveryLoop
+
+Handles USB headset unplug/replug during a call.
+
+### Disconnect
+1. Detect USB removal (WMI event or device list poll).
+2. Stop current FFmpeg subprocess cleanly (SIGTERM or `q\n`).
+3. Record segment end time via `time.monotonic()`.
+4. Save segment metadata (path, start_mono, end_mono).
+5. Mark recovery pending.
+
+### Reconnect
+1. Detect USB return.
+2. Re-run `DeviceResolver` to get new device name.
+3. Record segment start time via `time.monotonic()`.
+4. Start new FFmpeg subprocess for new segment.
+5. Clear recovery pending.
+
+### Gap
+`gap_seconds = new_segment_start_mono - previous_segment_end_mono`
+
+---
+
+## SegmentMerger
+
+Called by `Recorder.resolve_final_files()` after call ends.
+
+### Gap preservation
+
+1. For each gap between consecutive segments:
+   - `gap_seconds = next_segment.start_mono - prev_segment.end_mono`
+   - If `gap_seconds >= ffmpeg_gap_silence_threshold_seconds` and
+     `ffmpeg_preserve_usb_gap_silence=true`:
+     - Generate a WAV silence file of exactly `gap_seconds` duration.
+     - Mark silence file as temp (do not upload, do not store in DB).
+
+2. Build concat list:
+   ```
+   file 'segment_1.mp3'
+   file 'silence_gap_1.wav'
+   file 'segment_2.mp3'
+   ```
+
+3. FFmpeg concat copy attempt:
+   ```
+   ffmpeg -f concat -safe 0 -i concat_list.txt -c copy final_output.mp3
+   ```
+
+4. If copy fails: fallback re-encode:
+   ```
+   ffmpeg -f concat -safe 0 -i concat_list.txt -c:a libmp3lame -b:a 64k final_output.mp3
+   ```
+
+5. If both fail:
+   - Log error with full detail.
+   - Keep all original segments.
+   - Return first segment path as best-available output.
+   - Do not delete any evidence.
+
+### Temp file cleanup (on success only)
+
+- Delete concat list file.
+- Delete silence temp WAV files.
+- Delete individual segment files.
+- Keep only the final merged file.
+
+---
+
+## Config additions (planned for Phase 2+)
+
+```json
+"recorder": {
+    "backend": "ffmpeg",
+    "ffmpeg_path": "bin/ffmpeg.exe",
+    "ffmpeg_mode": "dual",
+    "ffmpeg_stall_threshold_seconds": 8.0,
+    "ffmpeg_gap_silence_threshold_seconds": 0.5,
+    "ffmpeg_preserve_usb_gap_silence": true,
+    "ffmpeg_keep_temp_segments": false,
+    "ffmpeg_diagnostics": true
+}
+```
+
+`"backend": "pyaudio"` retains the old PyAudio engine as rollback.
+`"backend": "ffmpeg"` is the target production default.
+
+---
+
+## PyAudio (enumeration/scoring only)
+
+PyAudio may be used temporarily in `DeviceResolver` to:
+- List input devices and score them (USB bonus, headset name patterns).
+- Detect if a USB mic is newly present vs the live device list (evidence-based reinit).
+
+Use a fresh `pyaudio.PyAudio()` instance for each enumeration call.
+Never hold a persistent PyAudio instance when FFmpeg backend is active.
+Never open a PyAudio stream for recording in the FFmpeg production path.
+
+---
+
+## Recorder public interface (unchanged)
 
 ```python
-# Per-source thread. Non-blocking poll then read; downmixes; resamples; pushes to _JitterBuffer.
-reader = _SourceReader(
-    name="LoopbackReader",          # or "MicReader"
-    stop_event=stop_event,
-    chunk_size=960,                 # frames per chunk (20ms at 48 kHz)
-    sample_width=2,                 # 16-bit PCM
-    source_channels=2,              # stream's native channel count
-    source_rate=48000,              # stream's native sample rate
-    mix_rate=48000,                 # output/WAV rate
-    frame_buf=lb_buf,               # _JitterBuffer owned by engine
-)
-reader.set_stream(stream, source_channels, source_rate)  # inject stream
-reader.go_offline()   # unblocks read() via stop_stream(), marks offline
-reader.is_online      # property
+# Properties
+is_recording: bool
+current_recording_path: Optional[str]
+started_at: Optional[datetime]
+
+# Methods
+start_recording() -> bool
+stop_recording() -> bool
+force_stop_recording() -> bool
+detach_context() -> RecordingContext
+detach_contexts() -> List[RecordingContext]
+resolve_final_files(contexts: List[RecordingContext]) -> List[str]
+resolve_final_file(ctx: RecordingContext) -> Optional[str]
+ensure_recording_alive() -> bool
+get_recording_metadata() -> dict
+refresh_bandicam_paths() -> bool   # alias
 ```
 
-**Non-blocking poll loop (per tick):**
-1. Poll `get_read_available()` every 2ms up to `max_polls = int(source_block_seconds / 0.002)`.
-2. If `avail >= chunk_size`: exit poll loop, read immediately.
-3. If budget exhausted: push `silence_raw` frame, log underflow (throttled), pace, `continue`.
-4. If `get_read_available()` raises: set `_get_avail_unsupported = True`, fall through to blocking read.
+---
 
-**MicReader channel mode (per-second window):**
-Accumulate L², R², LR cross-products. Every 1s compute L_rms, R_rms, LR_corr.
-- If `min/max < 0.25`: use stronger channel
-- Elif `corr >= 0.5`: average both channels
-- Else: use stronger channel
-Mode logged on change as `REC → mic channel mode | mode=... | L_rms=... | R_rms=... | corr=...`.
+## Timing rules
 
-Overflow logged `[REC-014]` inside `_JitterBuffer.push()`.
-Underflow logged `REC → source underflow | source=... | unavailable_ticks=N` (throttled 4s).
+- `time.monotonic()`: all segment duration and gap calculations.
+- `datetime.now()`: file names, human-readable log lines only.
+- Never mix monotonic and wall-clock for arithmetic.
 
-## _AudioWriter
+---
 
-```python
-# Writer thread. Wall-clock scheduled, never calls stream.read().
-writer = _AudioWriter(
-    stop_event=stop_event,
-    lb_buf=lb_buf,               # _JitterBuffer
-    mic_buf=mic_buf,             # _JitterBuffer
-    wav_file=wav_file,
-    chunk_size=960, sample_width=2, mix_rate=48000,
-    mic_gain=0.75,               # from config
-    loopback_gain=0.65,          # from config
-    debug_stems=True,
-    mic_debug_wav=...,           # wave.Wave_write or None
-    loopback_debug_wav=...,
-    lb_reader=lb_reader,
-    mic_reader=mic_reader,
-    on_bytes_written=engine._add_bytes_written,
-    reconnect_fn=engine._try_reconnect_streams_async,
-)
-```
+## PyAudio three-thread architecture (historical reference)
 
-Writer scheduling: `next_tick = time.monotonic() + block_seconds` (startup head-start, then
-`next_tick += block_seconds` each iteration — absolute, no drift).
-If behind by >10ms, logs `[REC-013]` and resets `next_tick` to prevent catch-up storm.
+The following was the production architecture before the FFmpeg migration decision.
+It is preserved here for reference and as the rollback backend implementation guide.
 
-`_MAX_HOLD = 1`: writer holds last good frame for at most 1 tick on underrun, then writes silence.
-Separate `_lb_hold` / `_mic_hold` counters; reset to 0 on each "ok" pop.
+### _SourceReader
 
-Pulls with `pop_or_hold()` — FIFO oldest-first; silence preferred over repeated stale frames.
-Uses `writeframesraw()` for both main WAV and debug stems; `wave.close()` finalises header.
+Non-blocking poll loop: check `get_read_available()` every 2ms up to one chunk budget.
+If frames ready → read. If budget exhausted → push silence frame.
+MicReader: per-second L/R channel analysis → `_mic_ch_mode` (left/right/average).
 
-Mixing formula (int32 intermediate, clamped to int16):
-```python
-val = int(lb_sample * loopback_gain + mic_sample * mic_gain)
-val = max(-32768, min(32767, val))
-```
+### _AudioWriter
 
-Level log every 4 seconds:
-```
-REC → levels | mic_rms=... | loopback_rms=... | mixed_rms=... | clipped=... | mic_online=Y/N | loopback_online=Y/N
-```
+Wall-clock scheduled (`next_tick += block_seconds`). Pulls via `_JitterBuffer.pop_or_hold()`.
+FIFO, oldest-first. MAX_HOLD=1 tick before silence. Startup: one tick head-start.
+Mix: `int(lb * loopback_gain + mic * mic_gain)`, clamped int16. `writeframesraw()`.
 
-## WAV file lifecycle
+### _JitterBuffer
 
-```python
-# _open_wav() called in start() under lock
-wav_file = wave.open(path, 'wb')
-wav_file.setnchannels(1)       # always mono
-wav_file.setsampwidth(2)       # 16-bit
-wav_file.setframerate(mix_rate)
+Thread-safe FIFO buffer, maxlen=4. `push()` drops oldest on overflow (logs [REC-014]).
+`pop_or_hold(online, last_frame, silence)` → ok / hold / offline.
 
-# _finalize_wav() called from stop() safety net and writer finally block
-wav_file.close()
-# also closes mic_debug_wav and loopback_debug_wav
-```
-
-## Debug stems
-
-- Files: `*_mic_debug.wav`, `*_loopback_debug.wav`
-- Written by **_AudioWriter only** — exact frames used for mixing
-- Same duration as final WAV (one chunk per tick)
-- Never uploaded, never in DB, not auto-deleted
-- Orphan scan uses `glob("*_seg1.wav")` — does NOT match debug stems
-- Controlled by `config.json recorder.debug_stems`
-
-## MP3 conversion with lameenc
-
-Called by `Recorder.resolve_final_files()` after WAV is finalized.
-Only the final mixed WAV is converted. Debug stems remain WAV, local only.
-
-```python
-def _convert_to_mp3(self, wav_path: str) -> Optional[str]:
-    mp3_path = wav_path.replace(".wav", ".mp3")
-    with wave.open(wav_path, 'rb') as wf:
-        frames = wf.readframes(wf.getnframes())
-        rate = wf.getframerate()
-        channels = wf.getnchannels()
-    encoder = lameenc.Encoder()
-    encoder.set_bit_rate(RECORDER_MP3_BITRATE)  # 64 kbps default
-    encoder.set_in_sample_rate(rate)
-    encoder.set_channels(channels)
-    encoder.set_quality(2)
-    mp3_data = encoder.encode(frames) + encoder.flush()
-    with open(mp3_path, "wb") as f:
-        f.write(mp3_data)
-    return mp3_path
-```
-
-## Watchdog thread
-
-Monitors `_record_thread` (the writer). If writer dies:
-1. `_trigger_recovery()` calls `_stop_readers()` (both readers go offline + join)
-2. Marks `_recovery_exhausted = True`
-3. `is_active` returns False
-4. `Recorder.ensure_recording_alive()` detects this and starts a new segment
-
-Watchdog does NOT try to restart the writer directly — the WAV is already finalized by the writer's `finally` block and cannot be reused.
-
-## Stop sequence
+### Stop sequence (PyAudio backend)
 
 ```
 stop() called
-  → set stop_event + watchdog_stop
-  → reader.go_offline() × 2   (calls stop_stream, unblocks blocking reads)
-  → also stop_stream() on stream refs
-  → reader.join(timeout=2s) × 2
-  → writer.join(timeout=5s)
-  → watchdog.join(timeout=2s)
+  → stop_event + watchdog_stop
+  → reader.go_offline() × 2
+  → reader.join(2s) × 2
+  → writer.join(5s)
+  → watchdog.join(2s)
   → stream.close() × 2
   → _finalize_wav()
 ```
 
-## Mic device selection
+### USB rules (PyAudio backend — carry forward to FFmpeg)
 
-`DeviceManager.select_best_mic_device()` calls `list_real_mic_devices()` which
-excludes all `[Loopback]` devices.  Three outcomes:
-
-| Situation | `select_best_mic_device()` | Behaviour |
-|-----------|---------------------------|-----------|
-| USB/headset present | USB/headset device | MicReader starts with stream |
-| USB absent, built-in exists | Built-in device | Fallback; log `REC → using built-in microphone fallback` |
-| No real mic | `None` | MicReader starts offline; log `REC → no real microphone available` |
-
-Loopback selection is separate inside `_open_loopback_stream()` — never affects mic.
-
-## USB disconnect/reconnect
-
-On disconnect: `on_usb_disconnect()` → `lb_reader.go_offline()` + `mic_reader.go_offline()`
-Writer fills silence for offline sources.
-
-On reconnect: `_try_reconnect_streams()` reopens missing stream(s) using
-`select_best_mic_device()` for mic (never loopback), then calls
-`reader.set_stream(new_stream, channels, rate)` to inject the new stream.
-PyAudio reinit only when BOTH streams are missing.
-
-Stop/reconnect race: `_reconnect_disabled` flag is set `True` by `stop()` before
-`stop_event.set()`.  `_try_reconnect_streams_async()` returns immediately if disabled.
-If a stream was opened just before the race, it is closed best-effort before returning.
-
-## Config
-
-```json
-"recorder": {
-    "sample_rate": 48000,
-    "chunk_size": 960,
-    "format": "mp3",
-    "mp3_bitrate": 64,
-    "mic_gain": 0.75,
-    "loopback_gain": 0.65,
-    "debug_stems": true
-}
-```
+- NEVER call `close()` on a WASAPI stream after USB removal.
+- NEVER call `pa.open()` on the record-loop thread.
+- `_reconnect_disabled` must be set by `stop()` before reconnect threads can fire.

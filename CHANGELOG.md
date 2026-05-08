@@ -1,5 +1,44 @@
 # Changelog
 
+## [Planned] FFmpeg recorder backend migration
+
+**Status: planned, not yet implemented. Documentation phase complete as of 2026-05-08.**
+
+### Reason for migration
+
+The PyAudio/WASAPI audio pipeline has been patched across three major revisions
+(rev1 three-thread, rev2 pacing, rev3 non-blocking readers + jitter buffer) and continues to
+produce robotic audio, 50% duty-cycle artifacts, and USB reconnect failures confirmed
+by debug stem analysis. Further patching of `_SourceReader`, `_AudioWriter`, and
+`_JitterBuffer` is not approved.
+
+### Expected changes
+
+- Replace `CaptureEngine` internals with an FFmpeg subprocess backend.
+- `_SourceReader`, `_AudioWriter`, `_JitterBuffer` removed from production path.
+- Manual PCM read/mix/write Python logic removed.
+- `lameenc` MP3 encoding replaced by FFmpeg native encoding.
+- Add `DeviceResolver` (runtime WASAPI device discovery via FFmpeg device listing).
+- Add `FFmpegCaptureEngine` (subprocess start/stop, stderr drain, file growth monitor).
+- Add `ProcessWatchdog` and `FileGrowthMonitor`.
+- Add `USBRecoveryLoop` (segment close on unplug, new segment on replug).
+- Add `SegmentMerger` with gap preservation (silence insertion, concat copy + re-encode fallback).
+- Preserve all existing `Recorder` public interface methods and properties.
+- Preserve all existing session lifecycle, finalization, upload, DB, report behavior.
+- Keep PyAudio backend behind `"backend": "pyaudio"` config key for rollback.
+- Update `whatsapp_watcher.spec` to bundle `bin/ffmpeg.exe`.
+
+### Files to keep stable (not implementation targets)
+
+`detector.py`, `state_machine.py`, `storage.py`, `uploader.py`, `report.py`, `launcher.py`
+
+### Files that will change
+
+`recorder.py`, `config.py`, `config.json`, `whatsapp_watcher.spec`
+Minor targeted changes to `main.py` only if required for segment recovery integration.
+
+---
+
 ## 2026-05-08 rev3 — Non-blocking readers, jitter buffer, mic channel mode, evidence-based USB reinit
 
 ### Root causes fixed

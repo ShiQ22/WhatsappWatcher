@@ -1,68 +1,115 @@
 # Project Memory — WhatsApp Watcher
 
-## Bandicam removed
+## Decision: FFmpeg recorder backend migration (2026-05-08)
 
-Native audio recorder replaced Bandicam completely. Bandicam-related aliases
-(`bandicam_path`, `bandicam_output_dir`, `refresh_bandicam_paths`) are kept as
-backward-compat properties that return `None` / `False` so existing callers
-don't crash. All recording goes through `CaptureEngine` (PyAudio loopback +
-microphone).
+**The PyAudio recorder backend has been rejected for production use.**
 
-## Audio pipeline architecture (current — 2026-05-08 rev3)
+Despite three major refactor cycles (rev1 three-thread architecture, rev2 pacing fixes,
+rev3 non-blocking readers + jitter buffer), the PyAudio/WASAPI pipeline continued to produce
+robotic audio artifacts confirmed by debug stem analysis. Each patch resolved one artifact
+while introducing another, and the root cause is the approach itself (manual PCM
+read/mix/write in Python threads), not a single fixable bug.
 
-Three independent daemon threads inside `CaptureEngine`. `_record_loop` is **removed**.
+**Approved direction:** Replace the recording backend with FFmpeg subprocess while keeping
+all other systems (detection, state machine, finalization, upload, DB, reports, launcher)
+exactly as they are.
 
-- **LoopbackReader / MicReader** (`_SourceReader`): **non-blocking poll loop** — check
-  `get_read_available()` every 2ms up to one full chunk budget (20ms). If frames available,
-  read immediately. If budget exhausted, push silence frame + pace + continue. Falls back to
-  blocking read if `get_read_available` unsupported (`_get_avail_unsupported` flag).
-- **MicReader**: per-second L/R channel analysis → `_mic_ch_mode` (`left`/`right`/`average`).
-  Chooses stronger channel when one is 4× the other (L_rms/R_rms ratio < 0.25); averages
-  when both similar and corr ≥ 0.5; else uses stronger. Mode logged on change.
-- **Writer** (`_AudioWriter`): wall-clock scheduled (`next_tick += block_seconds`). Startup:
-  `next_tick = time.monotonic() + block_seconds` (one tick head-start). Pulls via
-  `_JitterBuffer.pop_or_hold()` — FIFO oldest-first, holds last-good frame up to MAX_HOLD=1
-  tick on underrun, then silence. Applies `loopback_gain=0.65`, `mic_gain=0.75`.
-  Int32 mix, int16 clamp. `writeframesraw()` for WAV and debug stems.
-- **`_JitterBuffer`**: replaces `_FrameBuffer`. FIFO, maxlen=4. `push()` drops oldest on
-  overflow (logs `[REC-014]`). `pop_or_hold(online, last_frame, silence)` — ok/hold/offline.
-- Level log every 4s: mic_rms, loopback_rms, mixed_rms, clipped, online states.
-- `_record_thread` points to writer for watchdog/`is_active` compatibility.
+---
 
-**Non-blocking reader fix (2026-05-08 rev3)**: eliminated 50% duty-cycle audio islands.
-Root cause: `stream.read()` took exactly 20ms → sleep_for = 0 → immediate re-read → WASAPI
-ring buffer just drained → 20ms block → alternating real/silence frames (92-93% of active
-audio runs ≤ 40ms). Fix: 2ms-poll loop; underflow pushes silence (not skip).
+## Why PyAudio recorder was stopped
 
-**_JitterBuffer fix (2026-05-08 rev3)**: replaced `pop_latest_or_silence()` (discard-all-but-newest)
-with FIFO + hold-last. Pop-latest discarded valid frames when reader was slightly late, causing
-the same duty-cycle hole. FIFO maintains continuity; MAX_HOLD=1 prefers silence over stale audio.
+### Failure modes observed in production
 
-**Mic channel mode fix (2026-05-08 rev3)**: USB mono mics often expose only one active channel.
-Per-second L/R analysis picks the live channel instead of halving amplitude by averaging.
+1. **50% duty-cycle audio islands** — both LoopbackReader and MicReader alternated real/silence
+   frames at 20ms granularity. Confirmed from debug stems: 92-93% of active audio runs ≤ 40ms.
+   Root cause: blocking `stream.read(chunk)` takes exactly one chunk period, then sleep=0,
+   then re-read hits empty WASAPI ring buffer and blocks again. Alternating real/silence.
 
-**Evidence-based USB reinit (2026-05-08 rev3)**: `get_fresh_usb_mic_name_if_missing(live_names)`
-spawns temporary PA instance, confirms mismatch before forcing reinit. No unnecessary teardown.
+2. **Robotic microphone** — USB mono mics expose one active channel. Averaging L+R halved
+   amplitude. Per-second channel mode selection (rev3) reduced severity but did not eliminate.
 
-**Writer startup head-start (2026-05-08 rev3)**: one tick buffer before first pop prevents
-silent first tick when readers haven't produced their first frame yet.
+3. **Robotic loopback** — same 50% duty cycle from WASAPI loopback stalls.
 
-**Loopback-as-mic prevention (2026-05-08 rev2)**: `select_best_mic_device()` uses
-`list_real_mic_devices()` which filters out `[loopback]` devices. Loopback enumeration
-remains in `_open_loopback_stream()` only. Mic selection cases:
-- USB/headset: preferred (USB+headset score bonus)
-- Built-in fallback: allowed when no USB/headset
-- No real mic: `None` returned → loopback-only recording, mic stays offline
+4. **Echo at call start** — FIFO deque kept stale frames; writer mixed them out-of-phase.
 
-**Reconnect/stop race fix (2026-05-08 rev2)**: `_reconnect_disabled = True` set under
-lock in `stop()` before `stop_event.set()`. All reconnect paths return immediately if disabled.
+5. **Short recordings** — record thread broke out early on USB disconnect; WAV finalized
+   at disconnect time, not call end.
 
-## Audio fix history (pre-three-thread)
+6. **USB access violation** — `pyaudiowpatch.read()` on a dead WASAPI stream after USB
+   removal triggered a Windows C-level fault (uncatchable).
 
-- **Stereo-to-mono conversion**: loopback and mic both downmix before mix step.
-- **Silence detection**: `[REC-009]` logged if both streams silent for >6s (now in writer).
-- **Duration ratio check**: `[REC-010]` logged if written frames < 70% of elapsed wall time.
-- **Watchdog recovery**: writer thread death → readers stopped → Recorder creates new segment.
+7. **Reconnect failures** — race between reconnect thread and `stop()` leaked stream handles.
+
+8. **Manual jitter buffer** — `_JitterBuffer` was added to smooth the duty-cycle problem but
+   introduced hold-stale and overflow patterns of its own.
+
+### Why further patching is not viable
+
+Each of rev1, rev2, rev3 fixed a confirmed root cause but revealed another underneath.
+The pattern of "patch → new artifact → patch" indicates the PyAudio/WASAPI read-in-Python
+model cannot reliably handle WASAPI timing constraints on real consumer hardware.
+
+---
+
+## FFmpeg design principles
+
+1. **FFmpeg owns audio capture.** Python is the orchestrator; FFmpeg is the recorder.
+2. **Device names from FFmpeg.** Use `ffmpeg -list_devices true -f wasapi` for exact names.
+   Never hardcode device names. Never use PyAudio device names as FFmpeg inputs directly.
+3. **Runtime device discovery.** `DeviceResolver` runs on each PC at call start.
+   No per-PC configuration needed.
+4. **PyAudio for scoring only.** PyAudio may be used to enumerate and score devices
+   (USB bonus, name matching). It must not be used for recording.
+5. **No manual PCM in Python.** FFmpeg handles mixing, resampling, encoding.
+6. **Subprocess safety.** FFmpeg stderr must be drained in a daemon thread.
+   Never block on stderr.
+7. **Segment model for USB.** USB disconnect → close segment → wait → new segment on replug.
+8. **Gap preservation.** `time.monotonic()` measures segment gap. Generated silence fills
+   the gap before merge if `ffmpeg_preserve_usb_gap_silence=true`.
+9. **Merge safety.** Concat copy first; re-encode fallback. Original segments never deleted
+   on merge failure.
+10. **Rollback.** PyAudio backend stays behind `"backend": "pyaudio"` config until FFmpeg
+    passes manual tests.
+
+---
+
+## Known requirements (invariants that must be preserved)
+
+| Requirement | Detail |
+|-------------|--------|
+| One final file per call | After merge, one file is uploaded/stored/reported |
+| Back-to-back calls stay separate | Session split in main.py must produce two separate files |
+| USB unplug creates internal segments | Disconnect → segment closed; replug → new segment |
+| Gap preserved in merged file | USB unplug gap filled with silence before merge |
+| Upload/DB/report unchanged | Final file path, naming, upload flow identical to current |
+| Recorder public interface stable | All method/property signatures in `Recorder` unchanged |
+| No temp file uploads | Gap silence files and concat list files must not be uploaded |
+| Temp segments preserved on merge failure | Never delete evidence on error |
+
+---
+
+## Bandicam removed (historical — pre-2026-05-07)
+
+Native audio recorder replaced Bandicam completely. Bandicam aliases (`bandicam_path`,
+`bandicam_output_dir`, `refresh_bandicam_paths`) kept as backward-compat properties.
+`refresh_bandicam_paths` alias still required for `main.py` compatibility.
+
+---
+
+## Audio pipeline architecture (PyAudio — now rejected for production)
+
+Three independent daemon threads inside `CaptureEngine`. Architecture confirmed working for
+session management but audio quality not acceptable.
+
+- **LoopbackReader / MicReader** (`_SourceReader`): non-blocking poll loop.
+- **Writer** (`_AudioWriter`): wall-clock scheduled, WAV writes.
+- **`_JitterBuffer`**: FIFO with hold-last. Replaced `_FrameBuffer` in rev3.
+
+These classes (`_SourceReader`, `_AudioWriter`, `_JitterBuffer`) are NOT part of the FFmpeg
+backend. They may remain in `recorder.py` temporarily as the PyAudio rollback backend, but
+they must not be further patched as a production path.
+
+---
 
 ## Direction no-downgrade guard + session latch (2026-05-08)
 
@@ -72,174 +119,109 @@ Applied to both direction-propagation blocks in `main.py run()`.
 
 **Session latch** (`data/active_call_session.json`):
 - Saved when direction first proven (gate: `_direction_latched` flag in `run()` scope).
-- Restored on crash-restart if hwnd or session_generation matches and `saved_at` <= 3600 s ago.
+- Restored on crash-restart if hwnd or session_generation matches and `saved_at` ≤ 3600 s ago.
 - Cleared (file deleted) immediately after each finalize thread `.start()` in ALL paths.
 - `_direction_latched` reset to `False` in every latch-clear path.
 
 **Critical rule**: never restore latch for a clearly new call (no hwnd/gen match).
 
-## USB hot-swap fix (2026-05-08)
+---
 
-**Root cause 1 — access violation**: `pyaudiowpatch.read()` on a dead WASAPI stream
-after USB removal can crash the process (Windows C-level fault, uncatchable).
-Fix: `CaptureEngine.on_usb_disconnect()` nulls stream refs under lock before the record
-loop can read them.  `stop_stream()` only — never `close()` after USB removal.
+## USB hot-swap fix (2026-05-08, PyAudio era)
 
-**Root cause 2 — short WAV**: record loop broke out when both streams were `None`.
-Fix: writes silence, calls `_try_reconnect_streams_async()`, sleeps, continues.
-WAV wall-clock duration is preserved.
+**Root causes:**
+1. `close()` after USB removal → Windows access violation.
+2. Record loop broke out when both streams `None` → short WAV.
+3. Reconnect/stop race → stream handle leak.
 
-**Root cause 3 — robotic mic after reconnect**: `_on_usb_reconnect` triggered watchdog
-path which only worked when the record thread was dead.
-Fix: `_try_reconnect_streams_async()` / `_try_reconnect_streams()` always reopens
-loopback + mic unconditionally after reinit_pyaudio().
+**Fixes (PyAudio backend):**
+- `on_usb_disconnect()` nulls streams under lock; `stop_stream()` only, never `close()`.
+- Record loop writes silence on missing streams instead of breaking.
+- `_reconnect_disabled` flag prevents reconnect during `stop()`.
 
-**Critical rules**:
-- NEVER `close()` a WASAPI stream after USB removal.
-- NEVER call `pa.open()` on the record-loop thread (blocks 20-30 s).
-- `_try_reconnect_streams_async()` is throttled: 2 s min between attempts.
+**For FFmpeg backend:** close subprocess cleanly on USB removal; preserve partial segment.
+
+---
 
 ## MP3 / 48 kHz output (2026-05-08)
 
 Config: `format=mp3`, `sample_rate=48000`, `chunk_size=960`, `mp3_bitrate=64`.
-USB device native rate is 48000 Hz; 44100 was always being auto-rejected and falling back.
-MP3 @ 64 kbps is transparent for voice and reduces file size ~4× vs WAV.
+USB device native rate is 48000 Hz; 44100 was always auto-rejected.
+MP3 @ 64 kbps reduces file size ~4× vs WAV.
+
+FFmpeg backend will support MP3 output natively without `lameenc`.
+
+---
 
 ## Immediate ENDED return + terminal finalize ownership fix (2026-05-07)
 
 **Root cause 1 — 33-second delay:** `ensure_recording_alive()` called `_do_mute_check()` synchronously.
-`_do_mute_check` does a full UIA traversal (20-30 s). Fixed: spawn in daemon thread (`mute-check-health`).
+Fixed: spawn in daemon thread (`mute-check-health`).
 
-**Root cause 2 — REC-012 double finalize:** REC-012 guard ran for ENDED state (non-live,
-`_should_start_recording=False`), stopping recorder before terminal block ran. Fixed: added
-`and not sm.is_terminal_state()` to REC-012 condition.
-
-**Defense:** `ensure_recording_alive()` only called when `result.event is None` — any real event
-bypasses health checks and is processed immediately.
-
-**Detector ENDED paths:** All four terminal paths (UI-status, ringing-window-gone,
-active-window-gone, stale-ringing) now build result first, then reset state, then return.
-No INFO log before return.
+**Root cause 2 — REC-012 double finalize:** REC-012 fired before terminal block.
+Fixed: `and not sm.is_terminal_state()` added to REC-012 condition.
 
 **Rule:** `_do_mute_check` MUST NEVER be called synchronously on the main poll thread.
 
+---
+
 ## Fast back-to-back call boundary fix (2026-05-07)
 
-**Root cause:** `SESSION_WINDOW_GAP_SECONDS = 2.5` preserved ALL sessions for 2.5 s after the
-window disappeared.  For unanswered (ringing) calls, a new call starting within 2.5 s on the
-same hwnd would find `_ring_event_emitted=True` and never fire a new ring event.
+**Root cause:** `SESSION_WINDOW_GAP_SECONDS = 2.5` applied to all sessions including ringing.
 
-**Fix (detector.py window-missing block):**
-- `_session_answered_proof_seen=False` (ringing): emit ENDED immediately on first missing-window poll.
-- `_session_answered_proof_seen=True` (active call): keep 2.5 s gap as before.
-
-**Defense-in-depth (detector.py + main.py):**
-- `_session_generation` (int, `__init__` only) increments on each ring emission.
-- `DetectionResult.session_generation` carries the generation value.
-- `current_session_generation` in main.py tracks the current session's generation.
-- `different_generation` split condition: same hwnd but different generation → split.
-- `state.ringing` added to `strong_new_session` for post-terminal cooldown bypass.
-- `DETECTOR → strong new call bypassed post-terminal cooldown` log added.
-- `_last_ended_hwnd / _last_ended_ts / _last_ended_direction` saved in all ENDED paths.
+**Fix:**
+- Ringing sessions (`_session_answered_proof_seen=False`): emit ENDED immediately on window disappearance.
+- Active sessions (`_session_answered_proof_seen=True`): keep 2.5 s gap.
+- `_session_generation` increments on each ring; `different_generation` is a split trigger.
 
 **Critical rule:** Do NOT restore the 2.5 s window gap for ringing sessions.
 
-## Session boundary bug history and final design
+---
 
-### Problem (fixed 2026-05-07)
-Back-to-back WhatsApp calls could merge into one record/recording.
+## Session boundary design (2026-05-07)
 
-### Root causes found
-1. FIX-2 log in `detector.py` showed `old_hwnd=NEW | new_hwnd=NEW` because
-   `self._call_hwnd` was already reassigned before the log fired.
-2. ANSWERED, active no-event, and ongoing-phase `DetectionResult` objects
-   did not carry `hwnd=win.hwnd`.
+Session identity = hwnd of WhatsApp call window.
+Every `DetectionResult` while a call window exists carries `hwnd=win.hwnd`.
+Split condition: `is_live_session and is_new_call_event and not weak_call_started and (different_hwnd or strong_new_call or ringing/connecting states)`.
+Split path does NOT call `detector.reset()`.
 
-### Final design
-- **Session identity = hwnd** of the WhatsApp call window.
-- Every `DetectionResult` while a call window exists carries `hwnd=win.hwnd`.
-- Ring events (`INCOMING_RING`, `OUTGOING_RING`) always carry `is_strong_new_call=True`.
-- `CALL_STARTED` (unknown direction): `is_strong_new_call=True` only when UIA state
-  shows positive proof (`incoming`/`outgoing`/`ringing`/`connecting`/`has_end_call_button`
-  or a RINGING_LABELS status text). Without proof → `False` (cannot split live session).
-- `ANSWERED` carries `hwnd` but not `is_strong_new_call=True`.
-- `previous_hwnd = self._call_hwnd` and `previous_direction = self._call_direction`
-  are saved before the `if new_window:` block in `detector.poll()`.
-- `main.py` `_TERMINAL_STATES = {IDLE, ENDED, RECORDER_ERROR, DETECTOR_ERROR}`.
-  Any other state is "live"; a new ring event while live triggers a split.
-  **A weak CALL_STARTED (`is_strong_new_call=False`) never triggers a split.**
-- Split path: join recorder thread (3 s) → deepcopy old session → stop/detach recorder →
-  finalize thread → `sm.transition(RESET)` → clear `current_session_hwnd`.
-  Does **not** call `detector.reset()`.
-
-### "Call ended" window defense (fixed 2026-05-07 follow-up)
-When the detector sees a window whose UIA status is in `ENDED_LABELS`:
-1. If `ring_event_emitted or answered_event_emitted or (new_window and previous_hwnd is not None)` →
-   emit `ENDED` with `direction = self._call_direction or previous_direction or "unknown"`.
-2. Else (first window ever, showing "Call ended") → return `DetectionResult(None, ...)`.
-3. Ring emission block: if `not ring_event_emitted` and status in `ENDED_LABELS` → return
-   `DetectionResult(None, ...)` before emitting any ring.
-
-### Recorder lifecycle ownership (final fix 2026-05-07)
-`recorder.start_recording()` is called **synchronously** in the poll loop — never
-in a background thread.  Async start was reverted because it allowed an orphan
-recorder to start after the session had already been reset.
-
-`_do_mute_check()` (UIA traversal, 20-30 s) runs in a daemon thread started
-inside `start_recording()` after engine.start() returns — this is the only
-async part and it is purely informational (mute logging).
-
-`[REC-011]` logged if engine or context phase of `start_recording()` > 2 s.
-`[REC-012]` orphan guard fires if `recorder.is_recording` when `_should_start_recording(sm)`
-is False — stops orphan recorder immediately and finalizes.
-
-**NEVER reintroduce async recorder start without a session token/cancel mechanism.**
-
-## USB selection behavior
-
-- `DeviceManager` scores input devices; USB headsets get highest score.
-- USB headset selected at call start is logged as `[DEV-USB] USB device selected`.
-- On disconnect during call: `[DEV-USB]` warning logged; recording continues on
-  whatever device survives.
-- On reconnect while idle: `[DEV-USB]` info "next call will use USB device."
-- On reconnect during recording: `[DEV-USB]` "USB reconnected; switch requested."
+---
 
 ## Upload / local DB / central sync
 
 - Local SQLite at `data/calls.db` (always written).
-- Central DB (optional): tried immediately on `save_call()`; failures are
-  retried in background `sync_unsynced_*` threads every
-  `CENTRAL_SYNC_INTERVAL_SECONDS`.
-- File uploads: `uploader.py` copies recording to a network path configured in
-  `config.json`. Retries up to `UPLOAD_RETRY_COUNT` times with
-  `UPLOAD_RETRY_DELAY_SECONDS` between attempts.
-- Failed uploads remain in `pending_uploads` table and are retried on next
-  background sync.
+- Central DB (optional): tried immediately on `save_call()`.
+- File uploads: `uploader.py` copies recording to network path from `config.json`.
+- Failed uploads remain in `pending_uploads` and retried on background sync.
+
+---
 
 ## Launcher / EXE behavior
 
-- `launcher.py` runs as the outer process (restart loop).
-- `--worker` flag runs `main.run()` once (inner process, no restart loop).
-- Launcher restarts worker on non-zero exit; stops on exit code 0.
+- `launcher.py` runs as outer process (restart loop).
+- `--worker` flag runs `main.run()` once (inner process).
 - Max `MAX_RESTARTS_PER_HOUR = 20` restarts before launcher gives up.
-- PyInstaller spec: `whatsapp_watcher.spec`.
+- PyInstaller spec: `whatsapp_watcher.spec` (needs update for `bin/ffmpeg.exe`).
+
+---
 
 ## Log code meanings
 
 | Code | Meaning |
 |---|---|
 | `[REC-001]` | No audio device available at recording start |
-| `[REC-002]` / `[REC-003]` | Loopback / mic stream open failed |
+| `[REC-002]` / `[REC-003]` | Loopback / mic stream open failed (PyAudio era) |
 | `[REC-008]` | WAV file open failed |
 | `[REC-009]` | Silence detected for >6s during recording |
-| `[REC-010]` | Written frames < 70% of expected (timing/buffer issue) |
-| `[REC-011]` | `recorder.start_recording()` engine or context phase > 2 s (WASAPI lock) |
-| `[REC-012]` | Orphan recorder guard — recorder running without live session; stopped immediately |
+| `[REC-010]` | Written frames < 70% of expected |
+| `[REC-011]` | `recorder.start_recording()` > 2 s |
+| `[REC-012]` | Orphan recorder guard fired |
+| `[REC-014]` | Buffer overflow (PyAudio era) |
 | `[DEV-003]` | Zero input devices enumerated |
 | `[DEV-USB]` | USB headset connect/disconnect/selection event |
 | `[UPL-001]` | Unhandled exception in `process_pending_uploads` |
 | `[UPL-002]` | File copy failure during upload |
 | `[UPL-004]` | Local recording file missing at upload time |
-| `SESSION SPLIT` | Back-to-back call boundary detected; old session finalized |
+| `SESSION SPLIT` | Back-to-back call boundary detected |
 | `CALL END` | Terminal state reached; finalize thread spawned |
-| `[LATCH]` | Session direction latch: save / restore / clear events |
+| `[LATCH]` | Session direction latch: save / restore / clear |
