@@ -3,11 +3,13 @@ from __future__ import annotations
 import collections
 import copy
 import faulthandler
+import json
 import logging
 import math
 import os
 import shutil
 import struct
+import subprocess
 import threading
 import time
 import wave
@@ -38,6 +40,11 @@ from config import (
     RECORDER_DEBUG_STEMS,
     RECORDER_MIC_GAIN,
     RECORDER_LOOPBACK_GAIN,
+    RECORDER_BACKEND,
+    RECORDER_HELPER_PATH,
+    RECORDER_HELPER_STARTUP_TIMEOUT,
+    RECORDER_HELPER_STOP_TIMEOUT,
+    RECORDER_HELPER_KEEP_TEMP,
 )
 
 log = logging.getLogger("watcher.recorder")
@@ -2189,6 +2196,268 @@ class CaptureEngine:
             return None
 
 
+class _HelperIpcBackend:
+    """
+    Manages a RecorderHelper.exe --ipc subprocess and the JSON IPC protocol.
+    One instance per Recorder when backend="helper".
+    stdout = JSON events only; stderr = diagnostics drained to log.debug.
+    """
+
+    _PING_TIMEOUT  = 2.0
+    _START_TIMEOUT = 10.0
+
+    def __init__(
+        self,
+        exe_path: str,
+        startup_timeout: float,
+        stop_timeout: float,
+        mic_gain: float,
+        loopback_gain: float,
+        keep_temp: bool,
+    ) -> None:
+        self._exe_path        = exe_path
+        self._startup_timeout = startup_timeout
+        self._stop_timeout    = stop_timeout
+        self._mic_gain        = mic_gain
+        self._loopback_gain   = loopback_gain
+        self._keep_temp       = keep_temp
+
+        self._lock  = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+
+        self._is_recording: bool         = False
+        self._current_path: Optional[str] = None
+        self._merged_path:  Optional[str] = None
+        self._merge_error:  Optional[str] = None
+
+        self._ready_evt   = threading.Event()
+        self._started_evt = threading.Event()
+        self._merged_evt  = threading.Event()
+        self._stopped_evt = threading.Event()
+        self._pong_evt    = threading.Event()
+
+        self._stderr_lines: collections.deque = collections.deque(maxlen=20)
+
+        self._launch()
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def _launch(self) -> None:
+        exe = Path(self._exe_path)
+        if not exe.is_absolute():
+            exe = (Path(__file__).parent / exe).resolve()
+        if not exe.exists():
+            raise FileNotFoundError(f"[RH-001] RecorderHelper not found: {exe}")
+        log.info("[RH] Launching IPC subprocess | exe=%s", exe)
+        self._proc = subprocess.Popen(
+            [str(exe), "--ipc"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+        )
+        threading.Thread(
+            target=self._stdout_reader, daemon=True, name="rh-stdout"
+        ).start()
+        threading.Thread(
+            target=self._stderr_reader, daemon=True, name="rh-stderr"
+        ).start()
+        if not self._ready_evt.wait(self._startup_timeout):
+            self._kill()
+            raise TimeoutError(
+                f"[RH-001] RecorderHelper did not emit 'ready' within "
+                f"{self._startup_timeout}s"
+            )
+        log.info("[RH] IPC subprocess ready")
+
+    def _kill(self) -> None:
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+        except Exception:
+            log.exception("[RH-005] Terminate failed")
+
+    def shutdown(self) -> None:
+        try:
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self._proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self._kill()
+        except Exception:
+            log.exception("[RH-005] Shutdown failed")
+
+    # ── commands ──────────────────────────────────────────────────────────────
+
+    def _send(self, cmd: dict) -> None:
+        try:
+            self._proc.stdin.write(json.dumps(cmd) + "\n")
+            self._proc.stdin.flush()
+        except Exception:
+            log.exception("[RH-002] IPC send failed | cmd=%s", cmd.get("cmd"))
+
+    def start_session(self, output_dir: str, base_name: str) -> bool:
+        self._started_evt.clear()
+        self._merged_evt.clear()
+        self._stopped_evt.clear()
+        with self._lock:
+            self._merged_path = None
+            self._merge_error = None
+        self._send({
+            "cmd":           "start",
+            "output_dir":    output_dir,
+            "base_name":     base_name,
+            "mic_gain":      self._mic_gain,
+            "loopback_gain": self._loopback_gain,
+            "keep_temp":     self._keep_temp,
+        })
+        if not self._started_evt.wait(self._START_TIMEOUT):
+            log.error("[RH-002] 'started' event not received within %.0fs",
+                      self._START_TIMEOUT)
+            return False
+        return True
+
+    def stop_session(self) -> None:
+        self._send({"cmd": "stop"})
+
+    def force_stop_session(self) -> None:
+        self._send({"cmd": "force_stop"})
+
+    def ping(self) -> bool:
+        self._pong_evt.clear()
+        self._send({"cmd": "ping"})
+        return self._pong_evt.wait(self._PING_TIMEOUT)
+
+    def wait_for_merged(self, timeout: float) -> Optional[str]:
+        self._merged_evt.wait(timeout)
+        with self._lock:
+            return self._merged_path
+
+    def wait_for_stopped(self, timeout: float) -> bool:
+        return self._stopped_evt.wait(timeout)
+
+    def is_process_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def get_last_stderr(self, n: int = 5) -> List[str]:
+        lines = list(self._stderr_lines)
+        return lines[-n:] if n < len(lines) else lines
+
+    @property
+    def current_path(self) -> Optional[str]:
+        with self._lock:
+            return self._current_path
+
+    # ── reader threads ────────────────────────────────────────────────────────
+
+    def _stdout_reader(self) -> None:
+        try:
+            for raw in self._proc.stdout:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("[RH] Non-JSON on stdout: %.120s", line)
+                    continue
+                self._dispatch(evt)
+        except Exception:
+            log.exception("[RH] stdout reader crashed")
+        finally:
+            # Unblock any waiters if the process dies unexpectedly.
+            self._ready_evt.set()
+            self._started_evt.set()
+            self._merged_evt.set()
+            self._stopped_evt.set()
+            self._pong_evt.set()
+
+    def _stderr_reader(self) -> None:
+        try:
+            for raw in self._proc.stderr:
+                line = raw.rstrip("\n")
+                if line:
+                    self._stderr_lines.append(line)
+                    log.debug("[RH] %s", line)
+        except Exception:
+            pass
+
+    def _dispatch(self, evt: dict) -> None:
+        name = evt.get("event", "")
+
+        if name == "ready":
+            self._ready_evt.set()
+
+        elif name == "started":
+            path = evt.get("path")
+            with self._lock:
+                self._is_recording = True
+                self._current_path = path
+            self._started_evt.set()
+            log.info("[RH] Recording started | segment=%s | path=%s",
+                     evt.get("segment"), path)
+
+        elif name == "seg_saved":
+            log.info("[RH] Segment saved | segment=%s | path=%s",
+                     evt.get("segment"), evt.get("path"))
+
+        elif name == "device_lost":
+            log.warning("[RH] Device lost | segment=%s", evt.get("segment"))
+
+        elif name == "device_restored":
+            log.info("[RH] Device restored | segment=%s | gap=%.1fs",
+                     evt.get("segment"), evt.get("gap_seconds", 0.0))
+
+        elif name == "merged":
+            path = evt.get("path")
+            with self._lock:
+                self._merged_path = path
+                self._merge_error = None
+            self._merged_evt.set()
+            log.info("[RH] Merge complete | path=%s | segments=%s",
+                     path, evt.get("segments"))
+
+        elif name == "merge_failed":
+            with self._lock:
+                self._merged_path = None
+                self._merge_error = evt.get("error", "unknown")
+            self._merged_evt.set()
+            log.error("[RH-004] Merge failed | error=%s | segments=%s",
+                      evt.get("error"), evt.get("segments"))
+
+        elif name == "stopped":
+            with self._lock:
+                self._is_recording = False
+                self._current_path = None
+            self._stopped_evt.set()
+            log.info("[RH] Session stopped")
+
+        elif name == "pong":
+            self._pong_evt.set()
+
+        elif name == "error":
+            code = evt.get("code", "?")
+            msg  = evt.get("message", "")
+            log.error("[RH-003] IPC error | code=%s | message=%s", code, msg)
+            # Unblock relevant waiters so callers don't hang on error.
+            if code in ("already_recording", "bad_params",
+                        "device_enum_failed", "no_render_device",
+                        "output_dir_error"):
+                self._started_evt.set()
+            elif code == "capture_exception":
+                self._merged_evt.set()
+                self._stopped_evt.set()
+
+        else:
+            log.debug("[RH] Unknown event: %s", name)
+
+
 class Recorder:
     """
     Public recording interface. Delegates to CaptureEngine for stream/WAV work.
@@ -2208,24 +2477,40 @@ class Recorder:
             log.warning("STARTUP → faulthandler could not be enabled")
 
         self._lock = threading.RLock()
-        self._device_manager = DeviceManager()
-        self._engine = CaptureEngine(self._device_manager)
 
-        # USB hot-swap: monitor for device removal and reconnection
-        self._usb_watcher_stop = threading.Event()
-        self._usb_watcher_thread = threading.Thread(
-            target=self._usb_watcher_loop,
-            daemon=True,
-            name="USBDeviceWatcher",
-        )
-        self._usb_watcher_thread.start()
+        if RECORDER_BACKEND == "helper":
+            self._helper: Optional[_HelperIpcBackend] = _HelperIpcBackend(
+                exe_path=RECORDER_HELPER_PATH,
+                startup_timeout=RECORDER_HELPER_STARTUP_TIMEOUT,
+                stop_timeout=RECORDER_HELPER_STOP_TIMEOUT,
+                mic_gain=RECORDER_MIC_GAIN,
+                loopback_gain=RECORDER_LOOPBACK_GAIN,
+                keep_temp=RECORDER_HELPER_KEEP_TEMP,
+            )
+            self._device_manager = None
+            self._engine = None
+            self._usb_watcher_stop = None
+            self._usb_watcher_thread = None
+        else:
+            self._helper = None
+            self._device_manager = DeviceManager()
+            self._engine = CaptureEngine(self._device_manager)
 
-        # Wire IMMNotificationClient callback (previously never called)
-        self._device_manager.register_change_callback(
-            self._on_device_change
-        )
+            # USB hot-swap: monitor for device removal and reconnection
+            self._usb_watcher_stop = threading.Event()
+            self._usb_watcher_thread = threading.Thread(
+                target=self._usb_watcher_loop,
+                daemon=True,
+                name="USBDeviceWatcher",
+            )
+            self._usb_watcher_thread.start()
 
-        self._log_all_devices()
+            # Wire IMMNotificationClient callback (previously never called)
+            self._device_manager.register_change_callback(
+                self._on_device_change
+            )
+
+            self._log_all_devices()
 
         self._is_recording: bool = False
         self._started_at: Optional[datetime] = None
@@ -2259,6 +2544,8 @@ class Recorder:
 
     @property
     def current_recording_path(self) -> Optional[str]:
+        if self._helper is not None:
+            return self._helper.current_path
         return self._engine.output_path
 
     @property
@@ -2286,6 +2573,9 @@ class Recorder:
         with self._lock:
             if self._is_recording:
                 return False
+
+        if self._helper is not None:
+            return self._start_recording_helper()
 
         _t0 = time.monotonic()
         output_dir = RECORDER_OUTPUT_DIR
@@ -2395,6 +2685,9 @@ class Recorder:
             if not self._is_recording:
                 return False
 
+        if self._helper is not None:
+            return self._stop_recording_helper()
+
         self._engine.stop()
 
         with self._lock:
@@ -2408,6 +2701,9 @@ class Recorder:
         return True
 
     def force_stop_recording(self) -> bool:
+        if self._helper is not None:
+            return self._force_stop_recording_helper()
+
         try:
             self._engine.stop()
         except Exception:
@@ -2442,6 +2738,9 @@ class Recorder:
         raise IndexError("No completed recording contexts available")
 
     def resolve_final_files(self, contexts: List[RecordingContext]) -> List[str]:
+        if self._helper is not None:
+            return self._resolve_final_files_helper(contexts)
+
         result: List[str] = []
         any_failed = False
         for ctx in contexts:
@@ -2519,6 +2818,9 @@ class Recorder:
         return files[0] if files else None
 
     def ensure_recording_alive(self) -> bool:
+        if self._helper is not None:
+            return self._ensure_recording_alive_helper()
+
         with self._lock:
             if not self._is_recording:
                 return True
@@ -2584,6 +2886,140 @@ class Recorder:
             self._recording_issues = "[HLT-002]"
         log.error("[HLT-002] Recovery failed — could not start new segment")
         return False
+
+    # ── helper backend private methods ────────────────────────────────────────
+
+    def _start_recording_helper(self) -> bool:
+        output_dir = RECORDER_OUTPUT_DIR
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        with self._lock:
+            seg = self._segment_counter
+        base_name = f"{ts}_seg{seg}"
+
+        pre_snap = self._snapshot_output_dir(output_dir)
+        now = datetime.now()
+
+        if not self._helper.start_session(output_dir, base_name):
+            return False
+
+        with self._lock:
+            self._is_recording = True
+            self._started_at = now
+            self._recording_success = False
+            self._recording_issues = None
+            self._restart_count = 0
+            self._active_context = RecordingContext(
+                pre_start_snapshot=pre_snap,
+                start_marker=time.time(),
+                started_at=now,
+                output_dir=output_dir,
+                segment_index=seg,
+                output_path=None,
+            )
+
+        log.info("[RH] Recording started | segment=%s | base=%s", seg, base_name)
+        return True
+
+    def _stop_recording_helper(self) -> bool:
+        self._helper.stop_session()
+
+        with self._lock:
+            self._is_recording = False
+            ctx = self._active_context
+            self._active_context = None
+            if ctx is not None:
+                self._completed_contexts.append(ctx)
+
+        log.info("[RH] Stop dispatched | segment=%s", self._segment_counter)
+        return True
+
+    def _force_stop_recording_helper(self) -> bool:
+        try:
+            self._helper.force_stop_session()
+        except Exception:
+            log.exception("[RH-004] force_stop: helper send raised")
+
+        with self._lock:
+            self._is_recording = False
+            ctx = self._active_context
+            self._active_context = None
+            if ctx is not None:
+                self._completed_contexts.append(ctx)
+
+        log.info("[RH] Force stop dispatched | segment=%s", self._segment_counter)
+        return True
+
+    def _resolve_final_files_helper(
+        self, contexts: List[RecordingContext]
+    ) -> List[str]:
+        path = self._helper.wait_for_merged(self._helper._stop_timeout)
+
+        if path is None:
+            log.error("[RH-004] No merged output — merge failed or timed out")
+            with self._lock:
+                self._recording_success = False
+                self._recording_issues = "[RH-004]"
+            return []
+
+        for ctx in contexts:
+            ctx.output_path = path
+
+        deadline = time.time() + 5.0
+        found = False
+        while time.time() < deadline:
+            p = Path(path)
+            if p.exists() and p.stat().st_size >= 100:
+                found = True
+                break
+            time.sleep(0.1)
+
+        if not found:
+            log.error("[RH-006] Merged WAV never appeared | path=%s", path)
+            with self._lock:
+                self._recording_success = False
+                self._recording_issues = "[RH-006]"
+            return []
+
+        try:
+            with wave.open(path, "rb") as wf:
+                frames = wf.getnframes()
+                duration = frames / wf.getframerate()
+            if duration < 0.5:
+                log.warning("[RH-006] WAV too short | duration=%.2fs", duration)
+                _safe_rename_corrupted(path)
+                with self._lock:
+                    self._recording_success = False
+                    self._recording_issues = "[RH-006]"
+                return []
+        except Exception:
+            log.exception("[RH-006] WAV corrupted | path=%s", path)
+            _safe_rename_corrupted(path)
+            with self._lock:
+                self._recording_success = False
+                self._recording_issues = "[RH-006]"
+            return []
+
+        with self._lock:
+            self._recording_success = True
+        return [path]
+
+    def _ensure_recording_alive_helper(self) -> bool:
+        with self._lock:
+            if not self._is_recording:
+                return True
+
+        if not self._helper.is_process_alive():
+            log.error(
+                "[RH-002] RecorderHelper process died unexpectedly | stderr=%s",
+                self._helper.get_last_stderr(5),
+                exc_info=False,
+            )
+            with self._lock:
+                self._is_recording = False
+                self._recording_issues = "[RH-002]"
+            return False
+
+        return True
 
     # ── USB hot-swap ──────────────────────────────────────────────────────
 

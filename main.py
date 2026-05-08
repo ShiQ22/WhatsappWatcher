@@ -314,7 +314,15 @@ def _queue_closed_daily_reports(
 
 def _is_debug_stem(path: Path) -> bool:
     name = path.name
-    return name.endswith("_mic_debug.wav") or name.endswith("_loopback_debug.wav")
+    return (
+        name.endswith("_mic_debug.wav")
+        or name.endswith("_loopback_debug.wav")
+        # RecorderHelper IPC temp files — never upload these
+        or name.endswith("_mic.wav")
+        or name.endswith("_loopback.wav")
+        or "_mixed.wav" in name
+        or "_silence_" in name
+    )
 
 
 def _list_recoverable_recording_files(recorder: Recorder) -> list[Path]:

@@ -38,8 +38,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "watchdog_recovery_attempts": 2,
         "polling_fallback_interval_seconds": 2.0,
         "debug_stems": False,
-        "mic_gain": 0.75,
-        "loopback_gain": 0.65,
+        "mic_gain": 1.8,
+        "loopback_gain": 0.60,
+        "backend": "pyaudio",
+        "helper_path": "RecorderHelper/bin/Release/net8.0/RecorderHelper.exe",
+        "keep_temp": False,
+        "startup_timeout_seconds": 10.0,
+        "stop_timeout_seconds": 120.0,
     },
     "watcher": {
         "poll_interval_seconds": 0.8,
@@ -197,8 +202,25 @@ RECORDER_POLLING_FALLBACK_INTERVAL_SECONDS: float = float(
     RECORDER.get("polling_fallback_interval_seconds", _recorder_defaults["polling_fallback_interval_seconds"])
 )
 RECORDER_DEBUG_STEMS: bool = bool(RECORDER.get("debug_stems", _recorder_defaults.get("debug_stems", False)))
-RECORDER_MIC_GAIN: float = float(RECORDER.get("mic_gain", _recorder_defaults.get("mic_gain", 0.75)))
-RECORDER_LOOPBACK_GAIN: float = float(RECORDER.get("loopback_gain", _recorder_defaults.get("loopback_gain", 0.65)))
+RECORDER_MIC_GAIN: float = float(RECORDER.get("mic_gain", _recorder_defaults.get("mic_gain", 1.8)))
+RECORDER_LOOPBACK_GAIN: float = float(RECORDER.get("loopback_gain", _recorder_defaults.get("loopback_gain", 0.60)))
+
+# RecorderHelper IPC backend — used when recorder.backend = "helper"
+RECORDER_BACKEND: str = str(
+    RECORDER.get("backend", _recorder_defaults.get("backend", "pyaudio"))
+).strip().lower()
+RECORDER_HELPER_PATH: str = str(
+    RECORDER.get("helper_path", _recorder_defaults.get("helper_path", ""))
+)
+RECORDER_HELPER_STARTUP_TIMEOUT: float = float(
+    RECORDER.get("startup_timeout_seconds", _recorder_defaults.get("startup_timeout_seconds", 10.0))
+)
+RECORDER_HELPER_STOP_TIMEOUT: float = float(
+    RECORDER.get("stop_timeout_seconds", _recorder_defaults.get("stop_timeout_seconds", 120.0))
+)
+RECORDER_HELPER_KEEP_TEMP: bool = bool(
+    RECORDER.get("keep_temp", _recorder_defaults.get("keep_temp", False))
+)
 
 # Backwards compatibility aliases — kept so frozen modules (main.py et al.) keep importing.
 # Point BANDICAM_PATH at a file that always exists so main.py's existence check passes
