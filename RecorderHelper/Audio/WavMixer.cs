@@ -3,7 +3,7 @@ using NAudio.Wave;
 
 namespace RecorderHelper.Audio;
 
-public record MixResult(bool Success, long OutputBytes, double DurationSeconds);
+public record MixResult(bool Success, long OutputBytes, double DurationSeconds, long ClippedSamples = 0);
 
 /// <summary>
 /// Offline mixer: reads two normalized ISampleProviders and writes a single int16 mono WAV.
@@ -17,14 +17,14 @@ public static class WavMixer
     /// <param name="micPath">Path to mic temp WAV, or null if no mic was captured.</param>
     /// <param name="loopbackPath">Path to loopback temp WAV. Must exist and be non-empty.</param>
     /// <param name="outputPath">Destination mixed WAV path.</param>
-    /// <param name="micGain">Mic amplitude scale (default 0.75).</param>
-    /// <param name="loopGain">Loopback amplitude scale (default 0.65).</param>
+    /// <param name="micGain">Mic amplitude scale.</param>
+    /// <param name="loopGain">Loopback amplitude scale.</param>
     public static MixResult Mix(
         string? micPath,
         string  loopbackPath,
         string  outputPath,
-        float   micGain  = 0.75f,
-        float   loopGain = 0.65f)
+        float   micGain  = 2.0f,
+        float   loopGain = 0.55f)
     {
         if (!File.Exists(loopbackPath) || new FileInfo(loopbackPath).Length == 0)
         {
@@ -46,7 +46,8 @@ public static class WavMixer
                 micProvider = PcmNormalizer.Normalize(micReader);
             }
 
-            long bytesWritten = WriteBlocks(micProvider, micGain, loopProvider, loopGain, outputPath);
+            var (bytesWritten, clippedSamples) =
+                WriteBlocks(micProvider, micGain, loopProvider, loopGain, outputPath);
 
             if (bytesWritten == 0)
             {
@@ -56,7 +57,7 @@ public static class WavMixer
 
             // 48000 Hz / 1ch / 16-bit = 2 bytes per sample
             double duration = (double)bytesWritten / (TargetSampleRate * 2);
-            return new MixResult(true, bytesWritten, duration);
+            return new MixResult(true, bytesWritten, duration, clippedSamples);
         }
         finally
         {
@@ -67,7 +68,7 @@ public static class WavMixer
 
     private const int TargetSampleRate = PcmNormalizer.TargetSampleRate;
 
-    private static long WriteBlocks(
+    private static (long bytesWritten, long clippedSamples) WriteBlocks(
         ISampleProvider? micProvider,  float micGain,
         ISampleProvider  loopProvider, float loopGain,
         string outputPath)
@@ -79,6 +80,7 @@ public static class WavMixer
         float[] loopBuf = new float[BlockSizeSamples];
         byte[]  outBuf  = new byte[BlockSizeSamples * 2];
         long    total   = 0;
+        long    clipped = 0;
 
         while (true)
         {
@@ -90,9 +92,13 @@ public static class WavMixer
 
             for (int i = 0; i < toWrite; i++)
             {
-                float m = i < micRead  ? micBuf[i]  * micGain  : 0f;
-                float l = i < loopRead ? loopBuf[i] * loopGain : 0f;
-                short s = (short)(Math.Clamp(m + l, -1f, 1f) * short.MaxValue);
+                float m     = i < micRead  ? micBuf[i]  * micGain  : 0f;
+                float l     = i < loopRead ? loopBuf[i] * loopGain : 0f;
+                float mixed = m + l;
+
+                if (mixed > 1f || mixed < -1f) clipped++;
+
+                short s = (short)(Math.Clamp(mixed, -1f, 1f) * short.MaxValue);
                 BinaryPrimitives.WriteInt16LittleEndian(outBuf.AsSpan(i * 2), s);
             }
 
@@ -100,6 +106,6 @@ public static class WavMixer
             total += toWrite * 2;
         }
 
-        return total;
+        return (total, clipped);
     }
 }

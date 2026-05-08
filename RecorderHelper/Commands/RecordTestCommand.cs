@@ -1,3 +1,4 @@
+using System.Globalization;
 using RecorderHelper.Audio;
 using RecorderHelper.Models;
 
@@ -11,6 +12,8 @@ public static class RecordTestCommand
         int    seconds   = 15;
         string outputDir = Path.Combine(Path.GetTempPath(), "RecTest");
         bool   keepTemp  = false;
+        float  micGain   = settings.MicGain;
+        float  loopGain  = settings.LoopbackGain;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -20,9 +23,16 @@ public static class RecordTestCommand
                 outputDir = args[i + 1];
             else if (args[i] == "--keep-temp")
                 keepTemp = true;
+            else if (args[i] == "--mic-gain" && i + 1 < args.Length
+                && float.TryParse(args[i + 1], NumberStyles.Float, CultureInfo.InvariantCulture, out float mg))
+                micGain = mg;
+            else if (args[i] == "--loopback-gain" && i + 1 < args.Length
+                && float.TryParse(args[i + 1], NumberStyles.Float, CultureInfo.InvariantCulture, out float lg))
+                loopGain = lg;
         }
 
         Console.WriteLine($"[record-test] seconds={seconds}  output-dir={outputDir}  keep-temp={keepTemp}");
+        Console.WriteLine($"[record-test] mic_gain={micGain:F2}  loopback_gain={loopGain:F2}");
 
         // ── Enumerate and select devices ─────────────────────────────────────
         List<AudioDeviceInfo> captureDevices;
@@ -50,6 +60,7 @@ public static class RecordTestCommand
 
         Console.WriteLine($"[record-test] Selected mic:    {selectedMic?.FriendlyName ?? "(none — loopback only)"}");
         Console.WriteLine($"[record-test] Selected render: {selectedRender.FriendlyName}");
+        Console.WriteLine($"[record-test] Output dir:      {outputDir}");
 
         if (selectedMic is null)
             Console.Error.WriteLine("[WARN] No mic selected — output will contain remote audio only.");
@@ -64,6 +75,8 @@ public static class RecordTestCommand
             outputDir:       outputDir,
             baseName:        "test",
             durationSeconds: seconds,
-            keepTemp:        keepTemp);
+            keepTemp:        keepTemp,
+            micGain:         micGain,
+            loopGain:        loopGain);
     }
 }

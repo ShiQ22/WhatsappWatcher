@@ -39,4 +39,10 @@ public class AppSettings
 
     [JsonPropertyName("ping_interval_seconds")]
     public double PingIntervalSeconds { get; set; } = 5.0;
+
+    [JsonPropertyName("mic_gain")]
+    public float MicGain { get; set; } = 2.0f;
+
+    [JsonPropertyName("loopback_gain")]
+    public float LoopbackGain { get; set; } = 0.55f;
 }

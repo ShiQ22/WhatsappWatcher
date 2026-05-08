@@ -23,7 +23,9 @@ public sealed class MultiSegmentSession
         string           outputDir,
         string           baseName,
         int              durationSeconds,
-        bool             keepTemp)
+        bool             keepTemp,
+        float            micGain,
+        float            loopGain)
     {
         long deadline    = Stopwatch.GetTimestamp() + (long)(durationSeconds * Stopwatch.Frequency);
         int  segIndex    = 1;
@@ -110,12 +112,14 @@ public sealed class MultiSegmentSession
                         micPath:      micHasData ? micTempPath : null,
                         loopbackPath: loopTempPath,
                         outputPath:   mixedPath,
-                        micGain:      0.75f,
-                        loopGain:     0.65f);
+                        micGain:      micGain,
+                        loopGain:     loopGain);
 
                     if (result.Success)
                     {
                         Console.WriteLine($"[segment {segIndex}] Mixed — {result.OutputBytes:N0}B  ~{result.DurationSeconds:F1}s");
+                        if (result.ClippedSamples > 0)
+                            Console.Error.WriteLine($"[WARN] Clipping: {result.ClippedSamples:N0} samples exceeded [-1,1] (consider reducing mic_gain or loopback_gain)");
                         mergeList.Add(mixedPath);
                         segInfoList.Add(new SegmentInfo(segIndex, micTempPath, loopTempPath, mixedPath, stats));
                         mixOk = true;
