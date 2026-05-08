@@ -891,14 +891,17 @@ _LATCH_PATH = DATA_DIR / "active_call_session.json"
 
 def _should_update_direction(new_dir: Optional[str], current_dir: Optional[str]) -> bool:
     """Return True only when new_dir is a genuine improvement over current_dir.
-    "unknown" must never overwrite a proven "incoming"/"outgoing" direction.
+    Proven directions (incoming/outgoing) are immutable for the session.
+    Only allows None/unknown → incoming/outgoing transitions.
     """
     if not new_dir:
         return False
     if new_dir == current_dir:
         return False
-    if new_dir == "unknown" and current_dir in ("incoming", "outgoing"):
-        return False
+    if current_dir in ("incoming", "outgoing"):
+        return False  # proven direction cannot be changed
+    if new_dir not in ("incoming", "outgoing"):
+        return False  # only promote to a proven direction
     return True
 
 
@@ -1249,20 +1252,23 @@ def run() -> None:
                     _startup_latch = None  # consume once regardless of match
 
                 # Propagate direction / caller into session (best-effort).
-                # _should_update_direction guards against "unknown" overwriting
-                # a proven direction.
                 if _should_update_direction(result.direction, sm.session.direction):
                     sm.session.direction = result.direction
-                    if sm.session.direction in ("incoming", "outgoing") and not _direction_latched:
-                        _save_session_latch(
-                            sm.session.direction,
-                            current_session_hwnd,
-                            current_session_generation,
-                            sm.session.started_at,
-                        )
-                        _direction_latched = True
                 if result.caller_number:
                     sm.session.caller_number = result.caller_number
+                # Save latch when direction is now proven and hwnd is already assigned.
+                # Ring events (hwnd not yet updated) are handled by the
+                # post-transition latch-save block; this covers non-ring events.
+                if (not _direction_latched
+                        and sm.session.direction in ("incoming", "outgoing")
+                        and current_session_hwnd is not None):
+                    _save_session_latch(
+                        sm.session.direction,
+                        current_session_hwnd,
+                        current_session_generation,
+                        sm.session.started_at,
+                    )
+                    _direction_latched = True
 
                 # ── Recorder health check (idle cycles only) ─────────────
                 # Skip when an actual event is present — the event must be
@@ -1343,13 +1349,9 @@ def run() -> None:
                     current_session_hwnd = result_hwnd
                     current_session_generation = getattr(result, "session_generation", 0)
                     _direction_latched = False  # new session; allow its latch to be saved
-
-                # Re-apply direction after transition (state machine may have reset).
-                # _should_update_direction guards against "unknown" overwriting
-                # a proven direction.
-                if _should_update_direction(result.direction, sm.session.direction):
-                    sm.session.direction = result.direction
-                    if sm.session.direction in ("incoming", "outgoing") and not _direction_latched:
+                    # Direction may already be proven (set by pre-transition propagation).
+                    # Save latch now that the correct hwnd/generation are available.
+                    if sm.session.direction in ("incoming", "outgoing"):
                         _save_session_latch(
                             sm.session.direction,
                             current_session_hwnd,
@@ -1357,8 +1359,23 @@ def run() -> None:
                             sm.session.started_at,
                         )
                         _direction_latched = True
+
+                # Re-apply direction after transition (state machine may have reset).
+                if _should_update_direction(result.direction, sm.session.direction):
+                    sm.session.direction = result.direction
                 if result.caller_number:
                     sm.session.caller_number = result.caller_number
+                # Save latch if direction was proven for the first time post-transition.
+                if (not _direction_latched
+                        and sm.session.direction in ("incoming", "outgoing")
+                        and current_session_hwnd is not None):
+                    _save_session_latch(
+                        sm.session.direction,
+                        current_session_hwnd,
+                        current_session_generation,
+                        sm.session.started_at,
+                    )
+                    _direction_latched = True
 
                 new_state = sm.state.value
                 if new_state != _last_logged_state:

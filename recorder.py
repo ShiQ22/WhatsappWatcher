@@ -715,15 +715,22 @@ class CaptureEngine:
                 log.info("REC → reconnect skipped; streams already active")
                 return
 
-            # 3. Only reinit if something is missing
+            # 3. Only reinit when BOTH streams are missing.
+            #    Reinitializing with one stream still alive can invalidate it,
+            #    causing the record loop to read from a broken stream handle.
             if self._stop_event.is_set():
                 return
-            log.info("REC → reconnect thread: reinitializing PyAudio")
-            self._device_manager.reinit_pyaudio()
-
-            # 4. Stop check after reinit
-            if self._stop_event.is_set():
-                return
+            if need_lb and need_mic:
+                log.info("REC → reconnect thread: both streams missing — reinitializing PyAudio")
+                self._device_manager.reinit_pyaudio()
+                # 4. Stop check after reinit
+                if self._stop_event.is_set():
+                    return
+            else:
+                log.info(
+                    "REC → reconnect thread: one stream alive — skipping reinit"
+                    " | need_lb=%s | need_mic=%s", need_lb, need_mic,
+                )
 
             if need_lb:
                 new_lb = self._open_loopback_stream()

@@ -148,4 +148,4 @@ Rationale:
 
 ## Git commit hash
 
-`deb076d` — pushed to `origin/main`
+`deb076d` (initial), `3f68d9a` (reconnect + latch safety), see latest commit for final state
