@@ -2256,14 +2256,13 @@ class _HelperIpcBackend:
         log.info("[RH] Launching IPC subprocess | exe=%s", exe)
 
         # Hide the console window on Windows — IPC pipes are unaffected.
+        _startupinfo = None
+        _creationflags = 0
         if sys.platform == "win32":
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-            _si.wShowWindow = 0  # SW_HIDE
-            _cf = subprocess.CREATE_NO_WINDOW
-        else:
-            _si = None
-            _cf = 0
+            _startupinfo = subprocess.STARTUPINFO()
+            _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _startupinfo.wShowWindow = 0  # SW_HIDE
+            _creationflags = subprocess.CREATE_NO_WINDOW
 
         self._proc = subprocess.Popen(
             [str(exe), "--ipc"],
@@ -2273,8 +2272,8 @@ class _HelperIpcBackend:
             text=True,
             bufsize=1,
             encoding="utf-8",
-            startupinfo=_si,
-            creationflags=_cf,
+            startupinfo=_startupinfo,
+            creationflags=_creationflags,
         )
         threading.Thread(
             target=self._stdout_reader, daemon=True, name="rh-stdout"
@@ -3076,14 +3075,13 @@ class Recorder:
                  wav_path, RECORDER_MP3_BITRATE)
 
         # Hide the console window on Windows — stdout/stderr are still captured.
+        _startupinfo = None
+        _creationflags = 0
         if sys.platform == "win32":
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-            _si.wShowWindow = 0  # SW_HIDE
-            _cf = subprocess.CREATE_NO_WINDOW
-        else:
-            _si = None
-            _cf = 0
+            _startupinfo = subprocess.STARTUPINFO()
+            _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _startupinfo.wShowWindow = 0  # SW_HIDE
+            _creationflags = subprocess.CREATE_NO_WINDOW
 
         try:
             result = subprocess.run(
@@ -3099,8 +3097,8 @@ class Recorder:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                startupinfo=_si,
-                creationflags=_cf,
+                startupinfo=_startupinfo,
+                creationflags=_creationflags,
             )
         except Exception:
             log.exception("[RH-MP3-004] Exception running ffmpeg | wav=%s", wav_path)
