@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import wave
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
