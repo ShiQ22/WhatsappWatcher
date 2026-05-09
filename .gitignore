@@ -15,10 +15,15 @@ recordings/
 # build output
 dist/
 build/
+deploy/
 *.spec.bak
 
 # bundled binaries — never commit
 bin/*.exe
+
+# .NET build artifacts — never commit
+RecorderHelper/bin/
+RecorderHelper/obj/
 
 # python cache
 __pycache__/

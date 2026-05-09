@@ -41,7 +41,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mic_gain": 1.8,
         "loopback_gain": 0.60,
         "backend": "pyaudio",
-        "helper_path": "RecorderHelper/bin/Release/net8.0/RecorderHelper.exe",
+        "helper_path": "RecorderHelper/RecorderHelper.exe",
         "keep_temp": False,
         "startup_timeout_seconds": 10.0,
         "stop_timeout_seconds": 120.0,
