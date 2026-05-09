@@ -6,29 +6,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-def _resolve_app_dir() -> Path:
-    """
-    Returns the directory that contains the running EXE (frozen) or this
-    source file (development).  Never returns sys._MEIPASS.
-
-    In a PyInstaller one-file bundle sys.frozen / sys.executable can be
-    unreliable depending on the PyInstaller version.  The Win32
-    GetModuleFileNameW(0) call is authoritative: it always returns the path
-    of the process EXE as reported by the OS.
-    """
-    if hasattr(sys, "_MEIPASS") or getattr(sys, "frozen", False):
-        try:
-            import ctypes
-            buf = ctypes.create_unicode_buffer(32768)
-            if ctypes.windll.kernel32.GetModuleFileNameW(0, buf, len(buf)):
-                return Path(buf.value).parent.resolve()
-        except Exception:
-            pass
-        # Fallback: sys.executable should be the EXE path in PyInstaller builds
-        return Path(sys.executable).parent.resolve()
-    return Path(__file__).parent.resolve()
-
-BASE_DIR = _resolve_app_dir()
+if getattr(sys, "frozen", False):
+    # PyInstaller onedir: sys.executable = <deploy folder>\WhatsAppWatcher.exe
+    # sys.executable.parent is therefore the deploy folder — reliable in onedir.
+    BASE_DIR = Path(sys.executable).parent.resolve()
+else:
+    BASE_DIR = Path(__file__).parent.resolve()
 
 CONFIG_PATH = BASE_DIR / "config.json"
 CONFIG_LOAD_ERROR: Optional[str] = None
