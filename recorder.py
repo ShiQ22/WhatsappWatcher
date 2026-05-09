@@ -2251,7 +2251,20 @@ class _HelperIpcBackend:
             exe = (BASE_DIR / exe).resolve()
         if not exe.exists():
             raise FileNotFoundError(f"[RH-001] RecorderHelper not found: {exe}")
+
+        log.info("[RH] APP_DIR=%s", BASE_DIR)
         log.info("[RH] Launching IPC subprocess | exe=%s", exe)
+
+        # Hide the console window on Windows — IPC pipes are unaffected.
+        if sys.platform == "win32":
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0  # SW_HIDE
+            _cf = subprocess.CREATE_NO_WINDOW
+        else:
+            _si = None
+            _cf = 0
+
         self._proc = subprocess.Popen(
             [str(exe), "--ipc"],
             stdin=subprocess.PIPE,
@@ -2260,6 +2273,8 @@ class _HelperIpcBackend:
             text=True,
             bufsize=1,
             encoding="utf-8",
+            startupinfo=_si,
+            creationflags=_cf,
         )
         threading.Thread(
             target=self._stdout_reader, daemon=True, name="rh-stdout"
@@ -2478,6 +2493,11 @@ class Recorder:
             log.info("STARTUP → faulthandler enabled | crash_log=%s", _crash_log)
         except Exception:
             log.warning("STARTUP → faulthandler could not be enabled")
+
+        log.info(
+            "STARTUP → paths | app_dir=%s | helper=%s | ffmpeg=%s",
+            BASE_DIR, RECORDER_HELPER_PATH, RECORDER_FFMPEG_PATH,
+        )
 
         self._lock = threading.RLock()
 
@@ -3055,6 +3075,16 @@ class Recorder:
         log.info("[RH-MP3] Converting WAV to MP3 | wav=%s | bitrate=%sk",
                  wav_path, RECORDER_MP3_BITRATE)
 
+        # Hide the console window on Windows — stdout/stderr are still captured.
+        if sys.platform == "win32":
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0  # SW_HIDE
+            _cf = subprocess.CREATE_NO_WINDOW
+        else:
+            _si = None
+            _cf = 0
+
         try:
             result = subprocess.run(
                 [
@@ -3069,6 +3099,8 @@ class Recorder:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                startupinfo=_si,
+                creationflags=_cf,
             )
         except Exception:
             log.exception("[RH-MP3-004] Exception running ffmpeg | wav=%s", wav_path)
