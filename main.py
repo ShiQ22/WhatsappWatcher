@@ -924,6 +924,12 @@ def _should_update_direction(new_dir: Optional[str], current_dir: Optional[str])
     return True
 
 
+def _is_real_number(n) -> bool:
+    """Return True when n is a genuine caller-number string, not a placeholder."""
+    s = str(n).strip() if n is not None else ""
+    return bool(s) and s not in ("-", "unknown")
+
+
 def _save_session_latch(
     direction: str,
     hwnd: Optional[int],
@@ -1066,6 +1072,8 @@ def run() -> None:
     sync_lock = threading.Lock()
     cleanup_lock = threading.Lock()
     _direction_latched: bool = False
+    _session_direction_latch: Optional[str] = None   # proven direction for current call
+    _session_number_latch: Optional[str] = None       # real caller_number for current call
     _startup_latch: Optional[dict] = _load_session_latch()
     if _startup_latch:
         log.info(
@@ -1222,6 +1230,15 @@ def run() -> None:
                     current_session_generation = 0
                     # Do NOT call detector.reset() — detector already tracks the new window.
                     _last_logged_state = None
+                    # Apply in-memory latches to the split snapshot so finalize has proven data
+                    if split_snap.direction in (None, "unknown") and _session_direction_latch in ("incoming", "outgoing"):
+                        log.info("[LATCH] Applied direction latch to split snapshot | dir=%s", _session_direction_latch)
+                        split_snap.direction = _session_direction_latch
+                    if not _is_real_number(getattr(split_snap, "caller_number", None)) and _is_real_number(_session_number_latch):
+                        log.info("[LATCH] Applied number latch to split snapshot | number=%s", _session_number_latch)
+                        split_snap.caller_number = _session_number_latch
+                    _session_direction_latch = None
+                    _session_number_latch = None
                     if split_was_recording and split_recorder_contexts:
                         split_t = threading.Thread(
                             target=_finalize_call,
@@ -1273,8 +1290,14 @@ def run() -> None:
                 # Propagate direction / caller into session (best-effort).
                 if _should_update_direction(result.direction, sm.session.direction):
                     sm.session.direction = result.direction
-                if result.caller_number:
+                # Update in-memory direction latch whenever session direction becomes proven
+                if _should_update_direction(sm.session.direction, _session_direction_latch):
+                    _session_direction_latch = sm.session.direction
+                # Caller number: only allow real→real or placeholder→real; never overwrite real with placeholder
+                if _is_real_number(result.caller_number) and not _is_real_number(sm.session.caller_number):
                     sm.session.caller_number = result.caller_number
+                if _is_real_number(sm.session.caller_number) and not _is_real_number(_session_number_latch):
+                    _session_number_latch = sm.session.caller_number
                 # Save latch when direction is now proven and hwnd is already assigned.
                 # Ring events (hwnd not yet updated) are handled by the
                 # post-transition latch-save block; this covers non-ring events.
@@ -1312,6 +1335,13 @@ def run() -> None:
                         forced_stop_ok = recorder.force_stop_recording()
                     recorder_contexts = recorder.detach_contexts()
                     session_snap = copy.deepcopy(sm.session)
+                    # Apply in-memory latches before building error_details
+                    if session_snap.direction in (None, "unknown") and _session_direction_latch in ("incoming", "outgoing"):
+                        log.info("[LATCH] Applied direction latch to crash snapshot | dir=%s", _session_direction_latch)
+                        session_snap.direction = _session_direction_latch
+                    if not _is_real_number(getattr(session_snap, "caller_number", None)) and _is_real_number(_session_number_latch):
+                        log.info("[LATCH] Applied number latch to crash snapshot | number=%s", _session_number_latch)
+                        session_snap.caller_number = _session_number_latch
                     session_snap.ended_at = session_snap.ended_at or datetime.now()
                     error_parts = [part.strip() for part in (session_snap.error_details or "").split("|") if part.strip()]
                     error_parts.append("WhatsApp crashed or closed during active recording")
@@ -1325,6 +1355,8 @@ def run() -> None:
                     detector.reset()
                     current_session_hwnd = None
                     current_session_generation = 0
+                    _session_direction_latch = None
+                    _session_number_latch = None
                     _last_logged_state = None
                     can_finalize_recording = bool(recorder_contexts) and (stop_ok or forced_stop_ok)
                     if can_finalize_recording:
@@ -1349,6 +1381,18 @@ def run() -> None:
                     continue
 
                 if result.event is None:
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                # Guard: stale terminal events while already idle must not create
+                # spurious sessions or affect the finalizing session's data.
+                if sm.state == CallState.IDLE and result.event in (
+                    CallEvent.ENDED, CallEvent.MISSED, CallEvent.CANCELLED
+                ):
+                    log.debug(
+                        "GUARD → ignoring stale %s while idle | dir=%s",
+                        result.event, result.direction or "-",
+                    )
                     time.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -1382,8 +1426,14 @@ def run() -> None:
                 # Re-apply direction after transition (state machine may have reset).
                 if _should_update_direction(result.direction, sm.session.direction):
                     sm.session.direction = result.direction
-                if result.caller_number:
+                # Update in-memory direction latch
+                if _should_update_direction(sm.session.direction, _session_direction_latch):
+                    _session_direction_latch = sm.session.direction
+                # Caller number: only allow real→real or placeholder→real
+                if _is_real_number(result.caller_number) and not _is_real_number(sm.session.caller_number):
                     sm.session.caller_number = result.caller_number
+                if _is_real_number(sm.session.caller_number) and not _is_real_number(_session_number_latch):
+                    _session_number_latch = sm.session.caller_number
                 # Save latch if direction was proven for the first time post-transition.
                 if (not _direction_latched
                         and sm.session.direction in ("incoming", "outgoing")
@@ -1496,6 +1546,16 @@ def run() -> None:
                         log.info("RECORDER → not active at terminal state %s", sm.state.value)
 
                     session_snap = copy.deepcopy(sm.session)
+                    # Apply in-memory latches — ensures finalize uses proven direction/number
+                    # even if the session was noisy or partially reset before terminal state.
+                    if session_snap.direction in (None, "unknown") and _session_direction_latch in ("incoming", "outgoing"):
+                        log.info("[LATCH] Applied direction latch to session snapshot | dir=%s", _session_direction_latch)
+                        session_snap.direction = _session_direction_latch
+                    if not _is_real_number(getattr(session_snap, "caller_number", None)) and _is_real_number(_session_number_latch):
+                        log.info("[LATCH] Applied number latch to session snapshot | number=%s", _session_number_latch)
+                        session_snap.caller_number = _session_number_latch
+                    _session_direction_latch = None
+                    _session_number_latch = None
                     sm.transition(CallEvent.RESET)
                     detector.reset()
                     current_session_hwnd = None
@@ -1533,6 +1593,11 @@ def run() -> None:
                         ctx = recorder.detach_contexts()
                         if ctx:
                             snap = copy.deepcopy(sm.session)
+                            # Apply latches to exception-path snapshot
+                            if snap.direction in (None, "unknown") and _session_direction_latch in ("incoming", "outgoing"):
+                                snap.direction = _session_direction_latch
+                            if not _is_real_number(getattr(snap, "caller_number", None)) and _is_real_number(_session_number_latch):
+                                snap.caller_number = _session_number_latch
                             if snap.ended_at is None:
                                 snap.ended_at = datetime.now()
                             if not snap.status or snap.status == CallState.IDLE.value:
@@ -1557,6 +1622,8 @@ def run() -> None:
 
                 try:
                     sm.transition(CallEvent.RESET)
+                    _session_direction_latch = None
+                    _session_number_latch = None
                     _last_logged_state = None
                 except Exception:
                     log.exception("STATE → reset failed")

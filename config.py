@@ -49,6 +49,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "stop_timeout_seconds": 120.0,
         "ffmpeg_path": "bin/ffmpeg.exe",
         "keep_wav_after_mp3": False,
+        "min_valid_recording_bytes": 10000,
+        "min_valid_recording_seconds": 3.0,
     },
     "watcher": {
         "poll_interval_seconds": 0.8,
@@ -244,6 +246,12 @@ RECORDER_FFMPEG_PATH: str = (
 )
 RECORDER_KEEP_WAV_AFTER_MP3: bool = bool(
     RECORDER.get("keep_wav_after_mp3", _recorder_defaults.get("keep_wav_after_mp3", False))
+)
+MIN_VALID_RECORDING_BYTES: int = int(
+    RECORDER.get("min_valid_recording_bytes", _recorder_defaults.get("min_valid_recording_bytes", 10000))
+)
+MIN_VALID_RECORDING_SECONDS: float = float(
+    RECORDER.get("min_valid_recording_seconds", _recorder_defaults.get("min_valid_recording_seconds", 3.0))
 )
 
 # Backwards compatibility aliases — kept so frozen modules (main.py et al.) keep importing.

@@ -49,6 +49,8 @@ from config import (
     RECORDER_HELPER_KEEP_TEMP,
     RECORDER_FFMPEG_PATH,
     RECORDER_KEEP_WAV_AFTER_MP3,
+    MIN_VALID_RECORDING_BYTES,
+    MIN_VALID_RECORDING_SECONDS,
 )
 
 log = logging.getLogger("watcher.recorder")
@@ -2229,10 +2231,12 @@ class _HelperIpcBackend:
         self._lock  = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
 
-        self._is_recording: bool         = False
-        self._current_path: Optional[str] = None
-        self._merged_path:  Optional[str] = None
-        self._merge_error:  Optional[str] = None
+        self._is_recording: bool           = False
+        self._current_path: Optional[str]  = None
+        self._merged_path:  Optional[str]  = None
+        self._merge_error:  Optional[str]  = None
+        self._start_succeeded: bool        = False
+        self._requested_base_name: Optional[str] = None
 
         self._ready_evt   = threading.Event()
         self._started_evt = threading.Event()
@@ -2321,6 +2325,8 @@ class _HelperIpcBackend:
             log.exception("[RH-002] IPC send failed | cmd=%s", cmd.get("cmd"))
 
     def start_session(self, output_dir: str, base_name: str) -> bool:
+        self._start_succeeded = False
+        self._requested_base_name = base_name
         self._started_evt.clear()
         self._merged_evt.clear()
         self._stopped_evt.clear()
@@ -2339,7 +2345,8 @@ class _HelperIpcBackend:
             log.error("[RH-002] 'started' event not received within %.0fs",
                       self._START_TIMEOUT)
             return False
-        return True
+        # True only when helper emitted "started"; False on any error response
+        return self._start_succeeded
 
     def stop_session(self) -> None:
         self._send({"cmd": "stop"})
@@ -2417,6 +2424,7 @@ class _HelperIpcBackend:
             with self._lock:
                 self._is_recording = True
                 self._current_path = path
+            self._start_succeeded = True
             self._started_evt.set()
             log.info("[RH] Recording started | segment=%s | path=%s",
                      evt.get("segment"), path)
@@ -2463,11 +2471,33 @@ class _HelperIpcBackend:
             code = evt.get("code", "?")
             msg  = evt.get("message", "")
             log.error("[RH-003] IPC error | code=%s | message=%s", code, msg)
-            # Unblock relevant waiters so callers don't hang on error.
-            if code in ("already_recording", "bad_params",
-                        "device_enum_failed", "no_render_device",
-                        "output_dir_error"):
+            if code == "already_recording":
+                with self._lock:
+                    active = self._current_path or ""
+                requested = self._requested_base_name or ""
+                log.warning(
+                    "[RH] start rejected — already_recording"
+                    " | active_path=%s | requested_base=%s",
+                    active, requested,
+                )
+                # Same-session duplicate: requested base_name is in the active path
+                # (shouldn't normally happen because Python checks _is_recording first,
+                # but handled defensively to avoid losing a valid in-progress recording)
+                if requested and active and requested in active:
+                    log.info("[RH] already_recording — same session; treating as already started")
+                    self._start_succeeded = True
+                # else: _start_succeeded stays False → start_session() returns False
                 self._started_evt.set()
+            elif code in ("bad_params", "device_enum_failed",
+                          "no_render_device", "output_dir_error"):
+                # _start_succeeded stays False → start_session() returns False
+                self._started_evt.set()
+            elif code == "not_recording":
+                # Helper has no active session; unblock any waiting stop/merge callers
+                # so they return immediately rather than waiting the full stop_timeout.
+                log.warning("[RH] stop rejected — not_recording | unblocking merged/stopped waiters")
+                self._stopped_evt.set()
+                self._merged_evt.set()
             elif code == "capture_exception":
                 self._merged_evt.set()
                 self._stopped_evt.set()
@@ -3007,12 +3037,24 @@ class Recorder:
             with wave.open(path, "rb") as wf:
                 frames = wf.getnframes()
                 duration = frames / wf.getframerate()
-            if duration < 0.5:
-                log.warning("[RH-006] WAV too short | duration=%.2fs", duration)
-                _safe_rename_corrupted(path)
-                with self._lock:
-                    self._recording_success = False
-                    self._recording_issues = "[RH-006]"
+            _min_dur = max(0.5, MIN_VALID_RECORDING_SECONDS)
+            if duration < _min_dur:
+                if duration < 0.5:
+                    log.warning("[RH-006] WAV too short (corrupted?) | duration=%.2fs | path=%s",
+                                duration, path)
+                    _safe_rename_corrupted(path)
+                    with self._lock:
+                        self._recording_success = False
+                        self._recording_issues = "[RH-006]"
+                else:
+                    log.warning(
+                        "[RH-VAL] Recording too short | duration=%.2fs | min=%.1fs | path=%s",
+                        duration, _min_dur, path,
+                    )
+                    # Keep WAV for diagnostics; do not rename or delete
+                    with self._lock:
+                        self._recording_success = False
+                        self._recording_issues = "[RH-VAL] output too short"
                 return []
         except Exception:
             log.exception("[RH-006] WAV corrupted | path=%s", path)
@@ -3028,6 +3070,20 @@ class Recorder:
         if fmt == "mp3":
             mp3 = self._convert_wav_to_mp3(path)
             if mp3:
+                try:
+                    mp3_size = Path(mp3).stat().st_size
+                except OSError:
+                    mp3_size = -1
+                if mp3_size < MIN_VALID_RECORDING_BYTES:
+                    log.warning(
+                        "[RH-VAL] MP3 output too small | size=%d bytes | min=%d | path=%s",
+                        mp3_size, MIN_VALID_RECORDING_BYTES, mp3,
+                    )
+                    # Keep both WAV and MP3 for diagnostics; do not upload
+                    with self._lock:
+                        self._recording_success = False
+                        self._recording_issues = "[RH-VAL] output too small"
+                    return []
                 if not RECORDER_KEEP_WAV_AFTER_MP3:
                     try:
                         Path(path).unlink()
@@ -3046,6 +3102,19 @@ class Recorder:
             # WAV is first to match the existing pyaudio "both" ordering.
             mp3 = self._convert_wav_to_mp3(path)
             if mp3:
+                try:
+                    mp3_size = Path(mp3).stat().st_size
+                except OSError:
+                    mp3_size = -1
+                if mp3_size < MIN_VALID_RECORDING_BYTES:
+                    log.warning(
+                        "[RH-VAL] MP3 output too small | size=%d bytes | min=%d | path=%s",
+                        mp3_size, MIN_VALID_RECORDING_BYTES, mp3,
+                    )
+                    with self._lock:
+                        self._recording_success = False
+                        self._recording_issues = "[RH-VAL] output too small"
+                    return []
                 with self._lock:
                     self._recording_success = True
                 return [path, mp3]

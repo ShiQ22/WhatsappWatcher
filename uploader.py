@@ -204,6 +204,21 @@ class UploadManager:
     def _process_one(self, *, local_path: str, dest_rel_path: str, retries_so_far: int) -> Tuple[Optional[str], Optional[str], int]:
         src = Path(local_path)
         if not src.exists() or not src.is_file():
+            # Before declaring failure: check whether the remote destination already
+            # exists. This handles the stale-queue case where upload succeeded,
+            # local file was deleted, and the pending row is retried later.
+            if UPLOAD_ROOT_DIR:
+                try:
+                    dst_check = Path(UPLOAD_ROOT_DIR) / dest_rel_path
+                    if dst_check.exists() and dst_check.is_file() and dst_check.stat().st_size > 0:
+                        log.info(
+                            "Uploader: local missing but remote exists; marking uploaded"
+                            " | local=%s | remote=%s | size=%d bytes",
+                            src, dst_check, dst_check.stat().st_size,
+                        )
+                        return str(dst_check), None, retries_so_far
+                except Exception:
+                    pass  # share unreachable; fall through to real [UPL-004]
             log.error("[UPL-004] Uploader: local file missing | path=%s", src)
             message = f"[UPL-004] local file missing: {src}"
             return None, message, retries_so_far + 1
