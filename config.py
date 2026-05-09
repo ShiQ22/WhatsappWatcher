@@ -211,8 +211,14 @@ RECORDER_LOOPBACK_GAIN: float = float(RECORDER.get("loopback_gain", _recorder_de
 RECORDER_BACKEND: str = str(
     RECORDER.get("backend", _recorder_defaults.get("backend", "pyaudio"))
 ).strip().lower()
-RECORDER_HELPER_PATH: str = str(
-    RECORDER.get("helper_path", _recorder_defaults.get("helper_path", ""))
+_raw_helper_path: str = str(
+    RECORDER.get("helper_path", _recorder_defaults.get("helper_path", "RecorderHelper/RecorderHelper.exe"))
+    or "RecorderHelper/RecorderHelper.exe"
+)
+RECORDER_HELPER_PATH: str = (
+    _raw_helper_path
+    if Path(_raw_helper_path).is_absolute()
+    else str((BASE_DIR / _raw_helper_path).resolve())
 )
 RECORDER_HELPER_STARTUP_TIMEOUT: float = float(
     RECORDER.get("startup_timeout_seconds", _recorder_defaults.get("startup_timeout_seconds", 10.0))

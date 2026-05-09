@@ -23,6 +23,7 @@ import comtypes
 import comtypes.client
 
 from config import (
+    BASE_DIR,
     BANDICAM_PATH,
     RECORDER_OUTPUT_DIR,
     RECORDER_FORMAT,
@@ -2247,7 +2248,7 @@ class _HelperIpcBackend:
     def _launch(self) -> None:
         exe = Path(self._exe_path)
         if not exe.is_absolute():
-            exe = (Path(__file__).parent / exe).resolve()
+            exe = (BASE_DIR / exe).resolve()
         if not exe.exists():
             raise FileNotFoundError(f"[RH-001] RecorderHelper not found: {exe}")
         log.info("[RH] Launching IPC subprocess | exe=%s", exe)
@@ -2467,7 +2468,7 @@ class Recorder:
     """
 
     def __init__(self) -> None:
-        _crash_log = Path(__file__).parent / "logs" / "crash.log"
+        _crash_log = BASE_DIR / "logs" / "crash.log"
         _crash_log.parent.mkdir(exist_ok=True)
         try:
             faulthandler.enable(
