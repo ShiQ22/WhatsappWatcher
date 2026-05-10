@@ -3019,28 +3019,31 @@ class Recorder:
             # Single outcome log per recovery.
             # Slow (>= 1 s): always WARNING.  Fast (< 1 s): INFO, throttled to
             # once per 5-minute window; extras counted and reported in the next log.
+            # getattr guards against Recorder instances built via __new__ (e.g. tests).
             _AR_WINDOW = 300.0
             _now_t = time.monotonic()
+            _suppressed = getattr(self, "_ar_fast_suppressed", 0)
+            _last_log_t = getattr(self, "_ar_fast_last_log_t", 0.0)
             if _waited >= 1.0:
                 log.warning(
                     "[RH] slow already_recording recovery | waited=%.2fs | seg=%s",
                     _waited, seg,
                 )
-                if self._ar_fast_suppressed:
+                if _suppressed:
                     log.info(
                         "[RH] already_recording: %d fast recovery(s) not previously logged",
-                        self._ar_fast_suppressed,
+                        _suppressed,
                     )
                     self._ar_fast_suppressed = 0
                     self._ar_fast_last_log_t = _now_t
             else:
-                _since = _now_t - self._ar_fast_last_log_t
-                if self._ar_fast_last_log_t == 0.0 or _since >= _AR_WINDOW:
-                    if self._ar_fast_suppressed:
+                _since = _now_t - _last_log_t
+                if _last_log_t == 0.0 or _since >= _AR_WINDOW:
+                    if _suppressed:
                         log.info(
                             "[RH] already_recording recovered | waited=%.2fs"
                             " | +%d suppressed in last %.0fs | seg=%s",
-                            _waited, self._ar_fast_suppressed, _since, seg,
+                            _waited, _suppressed, _since, seg,
                         )
                     else:
                         log.info(
@@ -3050,7 +3053,7 @@ class Recorder:
                     self._ar_fast_suppressed = 0
                     self._ar_fast_last_log_t = _now_t
                 else:
-                    self._ar_fast_suppressed += 1
+                    self._ar_fast_suppressed = _suppressed + 1
 
         with self._lock:
             self._is_recording = True

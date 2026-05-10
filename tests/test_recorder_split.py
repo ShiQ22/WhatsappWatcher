@@ -141,6 +141,8 @@ class TestRecorderAlreadyRecovery(unittest.TestCase):
             rec._last_mute_check = 0.0
             rec._device_index = None
             rec._device_name_for_mute = ""
+            rec._ar_fast_suppressed = 0
+            rec._ar_fast_last_log_t = 0.0
             from pathlib import Path
             rec.bandicam_path = Path("/fake/config.py")
             rec.bandicam_output_dir = Path("/tmp")
