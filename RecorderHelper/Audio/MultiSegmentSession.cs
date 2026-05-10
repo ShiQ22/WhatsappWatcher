@@ -96,6 +96,7 @@ public sealed class MultiSegmentSession
         var mergeList    = new List<string>();
         var segInfoList  = new List<SegmentInfo>();
         var silencePaths = new List<string>();
+        var allSegTempPaths = new List<(string? Mic, string Loop)>();
 
         // Serialise and forward a JSON event (no-op in --record-test mode).
         void Emit(object payload) =>
@@ -125,6 +126,7 @@ public sealed class MultiSegmentSession
 
                 micTempPath  = captureSession.MicTempPath;
                 loopTempPath = captureSession.LoopTempPath;
+                allSegTempPaths.Add((micTempPath, loopTempPath));
 
                 writeText($"[segment {segIndex}] Mic temp:      {micTempPath ?? "(none)"}");
                 writeText($"[segment {segIndex}] Loopback temp: {loopTempPath}");
@@ -265,6 +267,14 @@ public sealed class MultiSegmentSession
         if (mergeList.Count == 0)
         {
             writeWarn("[merge] No valid mixed segments — cannot produce output.");
+            if (!keepTemp)
+            {
+                foreach (var (tmpMic, tmpLoop) in allSegTempPaths)
+                {
+                    TryDelete(tmpMic,  "mic temp",      writeText, writeWarn);
+                    TryDelete(tmpLoop, "loopback temp", writeText, writeWarn);
+                }
+            }
             Emit(new { @event = "merge_failed", error = "no valid segments", segments = Array.Empty<string>() });
             return 1;
         }
@@ -280,6 +290,14 @@ public sealed class MultiSegmentSession
         if (!merged || !HasAudioData(finalPath))
         {
             writeWarn("[merge] Merge failed or output is empty. All temp files preserved.");
+            if (!keepTemp)
+            {
+                foreach (var (tmpMic, tmpLoop) in allSegTempPaths)
+                {
+                    TryDelete(tmpMic,  "mic temp",      writeText, writeWarn);
+                    TryDelete(tmpLoop, "loopback temp", writeText, writeWarn);
+                }
+            }
             Emit(new { @event = "merge_failed", error = "merge failed or empty output", segments = mergeList.ToArray() });
             return 1;
         }

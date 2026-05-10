@@ -325,6 +325,18 @@ def _is_debug_stem(path: Path) -> bool:
     )
 
 
+_VALIDATION_REJECTED_MARKERS = frozenset({
+    "[rh-val]", "output too short", "output too small", "no_output",
+})
+
+def _is_validation_rejected(error_details) -> bool:
+    """Return True if error_details shows this call was intentionally rejected by RH-VAL."""
+    if not error_details:
+        return False
+    low = str(error_details).lower()
+    return any(m in low for m in _VALIDATION_REJECTED_MARKERS)
+
+
 def _list_recoverable_recording_files(recorder: Recorder) -> list[Path]:
     try:
         recorder.refresh_bandicam_paths()
@@ -383,6 +395,21 @@ def _recover_orphan_seg_files(recorder: Recorder, storage: Storage) -> int:
                     call_dt = datetime.strptime(timestamp, "%Y-%m-%d_%H-%M-%S")
                 except ValueError:
                     call_dt = datetime.now()
+
+                # Skip files for calls that were intentionally rejected by validation
+                try:
+                    nearby = storage.get_calls_by_start_time_window(
+                        call_dt - timedelta(seconds=30),
+                        call_dt + timedelta(seconds=30),
+                    )
+                    if any(_is_validation_rejected(r["error_details"]) for r in nearby):
+                        log.info(
+                            "RECOVERY → skipping orphan seg — validation-rejected DB row exists: %s",
+                            seg_file.name,
+                        )
+                        continue
+                except Exception:
+                    pass
 
                 class _OrphanSession:
                     pass
@@ -473,6 +500,14 @@ def _recover_orphan_recordings(
         used_paths: set[str] = set()
 
         for row in rows:
+            if _is_validation_rejected(row["error_details"]):
+                log.info(
+                    "RECOVERY → skipping call_local_id=%s — validation-rejected: %s",
+                    row["id"],
+                    row["error_details"],
+                )
+                continue
+
             matched = _pick_recovery_file_for_call(row, candidate_files)
             if not matched:
                 continue
@@ -716,6 +751,16 @@ def _recover_unfinalized_seg_files(
                     continue
 
                 row = unlinked[0]
+
+                if _is_validation_rejected(row["error_details"]):
+                    log.info(
+                        "RECOVERY → skipping seg file — matched call_local_id=%s was validation-rejected: %s | file=%s",
+                        row["id"],
+                        row["error_details"],
+                        seg_file.name,
+                    )
+                    continue
+
                 log.info(
                     "RECOVERY → matched seg to call_local_id=%s"
                     " | caller=%s | dir=%s",
