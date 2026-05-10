@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS pending_uploads (
     uploaded_path TEXT,
     status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    processing_at TEXT
 )
 """
 
@@ -233,7 +234,7 @@ class Storage:
         self.local_conn.commit()
 
     def _migrate_local_tables(self) -> None:
-        """Remove legacy answer_state column if it still exists."""
+        """Remove legacy answer_state column and add any missing columns."""
         with self._lock:
             cols = [
                 row[1]
@@ -266,6 +267,24 @@ class Storage:
                 self.local_conn.execute("DROP TABLE calls_legacy_with_answer_state")
                 self.local_conn.commit()
                 log.info("STORAGE → local DB migration complete")
+
+        # Add processing_at to pending_uploads for existing DBs that pre-date this column.
+        with self._lock:
+            pu_cols = [
+                row[1]
+                for row in self.local_conn.execute(
+                    "PRAGMA table_info(pending_uploads)"
+                ).fetchall()
+            ]
+            if "processing_at" not in pu_cols:
+                log.info(
+                    "STORAGE → migrating pending_uploads: adding processing_at column"
+                )
+                self.local_conn.execute(
+                    "ALTER TABLE pending_uploads ADD COLUMN processing_at TEXT"
+                )
+                self.local_conn.commit()
+                log.info("STORAGE → pending_uploads migration complete")
 
     # ── Central DB (SQLAlchemy pool) ─────────────────────────────────────────
 
@@ -727,16 +746,40 @@ class Storage:
         machine_name: Optional[str],
         machine_ip: Optional[str],
         max_retries: int,
+        initial_status: str = "pending",
     ) -> int:
+        """
+        Insert a new pending_uploads row.
+
+        Pass initial_status='processing' from upload_for_session() so the row
+        is never visible to the background scan as 'pending'.  The background
+        scan uses initial_status='pending' (the default).
+        """
         self._ensure_open()
         with self._lock:
             cur = self.local_conn.cursor()
-            cur.execute(
-                "INSERT INTO pending_uploads "
-                "(call_local_id, local_path, dest_rel_path, pc_user, machine_name, machine_ip, max_retries) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (call_local_id, local_path, dest_rel_path, pc_user, machine_name, machine_ip, max_retries),
-            )
+            if initial_status == "processing":
+                cur.execute(
+                    "INSERT INTO pending_uploads "
+                    "(call_local_id, local_path, dest_rel_path, pc_user, machine_name, "
+                    " machine_ip, max_retries, status, processing_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', CURRENT_TIMESTAMP)",
+                    (
+                        call_local_id, local_path, dest_rel_path,
+                        pc_user, machine_name, machine_ip, max_retries,
+                    ),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO pending_uploads "
+                    "(call_local_id, local_path, dest_rel_path, pc_user, machine_name, "
+                    " machine_ip, max_retries) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        call_local_id, local_path, dest_rel_path,
+                        pc_user, machine_name, machine_ip, max_retries,
+                    ),
+                )
             self.local_conn.commit()
             return int(cur.lastrowid)
 
@@ -760,7 +803,7 @@ class Storage:
         with self._lock:
             self.local_conn.execute(
                 "UPDATE pending_uploads SET uploaded_path=?, status='uploaded', "
-                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                "processing_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (uploaded_path, upload_id),
             )
             self.local_conn.commit()
@@ -778,6 +821,7 @@ class Storage:
                         ELSE 'pending'
                     END,
                     last_error=?,
+                    processing_at=NULL,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
@@ -791,10 +835,63 @@ class Storage:
         with self._lock:
             self.local_conn.execute(
                 "UPDATE pending_uploads SET retries=0, status='pending', last_error=NULL, "
-                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                "processing_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (upload_id,),
             )
             self.local_conn.commit()
+
+    def claim_upload_for_processing(self, upload_id: int) -> bool:
+        """
+        Atomically transition one upload row from pending/failed → processing.
+
+        A single UPDATE statement under the storage lock guarantees that only
+        one caller wins when two threads race on the same row.  Returns True
+        only when this caller made the transition (rowcount == 1).
+        """
+        self._ensure_open()
+        with self._lock:
+            cur = self.local_conn.execute(
+                """
+                UPDATE pending_uploads
+                SET status='processing',
+                    processing_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                  AND status IN ('pending', 'failed')
+                """,
+                (upload_id,),
+            )
+            self.local_conn.commit()
+            return cur.rowcount == 1
+
+    def reset_stale_processing_uploads(self, stale_after_seconds: int = 900) -> int:
+        """
+        Reset uploads stuck in 'processing' for longer than stale_after_seconds.
+
+        This handles the case where the app crashed or was killed while an
+        upload was in-flight.  Default 900 s (15 min) gives ample time even
+        for large files over a slow SMB link.
+        """
+        self._ensure_open()
+        from datetime import timedelta
+        stale_before = (
+            datetime.utcnow() - timedelta(seconds=stale_after_seconds)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cur = self.local_conn.execute(
+                """
+                UPDATE pending_uploads
+                SET status='pending',
+                    processing_at=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE status='processing'
+                  AND processing_at IS NOT NULL
+                  AND processing_at < ?
+                """,
+                (stale_before,),
+            )
+            self.local_conn.commit()
+            return cur.rowcount or 0
 
     # ── Read ─────────────────────────────────────────────────────────────────
 

@@ -30,6 +30,7 @@ from config import (
     LOG_DIR,
     LOG_LEVEL,
     LOG_MAX_BYTES,
+    MIN_VALID_RECORDING_SECONDS,
     POLL_INTERVAL_SECONDS,
     STARTUP_PENDING_UPLOAD_SCAN,
     UPLOAD_ENABLED,
@@ -282,12 +283,40 @@ def _finalize_no_recording(
     try:
         if getattr(session_snap, "ended_at", None) is None:
             session_snap.ended_at = datetime.now()
-        log.info(
-            "FINALIZE → no-recording | status=%s | dir=%s | number=%s",
-            session_snap.status,
-            session_snap.direction or "unknown",
-            getattr(session_snap, "caller_number", None) or "-",
+
+        # Guarantee error_details is never NULL in the DB for a no-recording call.
+        if not getattr(session_snap, "error_details", None):
+            session_snap.error_details = (
+                "Finalization called with recorder not active — no recording captured"
+            )
+
+        dur = (
+            session_snap.duration_seconds()
+            if hasattr(session_snap, "duration_seconds")
+            else 0
         )
+
+        # Long calls with no recording are unexpected — escalate to ERROR.
+        # Short/cancelled calls are expected (validation rejection) — stay INFO.
+        if dur >= MIN_VALID_RECORDING_SECONDS:
+            log.error(
+                "FINALIZE → long call saved with NO RECORDING"
+                " | dur=%ss | status=%s | dir=%s | number=%s | error=%s",
+                dur,
+                session_snap.status,
+                session_snap.direction or "unknown",
+                getattr(session_snap, "caller_number", None) or "-",
+                session_snap.error_details,
+            )
+        else:
+            log.info(
+                "FINALIZE → no-recording | status=%s | dir=%s | number=%s | dur=%ss",
+                session_snap.status,
+                session_snap.direction or "unknown",
+                getattr(session_snap, "caller_number", None) or "-",
+                dur,
+            )
+
         storage.save_call(session_snap)
         _maybe_clear_latch_for_session(session_snap)
         reporter.append_call(session_snap)
@@ -295,7 +324,7 @@ def _finalize_no_recording(
             "FINALIZE → complete (no recording) | status=%s | dir=%s | dur=%ss | number=%s | ip=%s",
             session_snap.status,
             session_snap.direction or "unknown",
-            session_snap.duration_seconds(),
+            dur,
             getattr(session_snap, "caller_number", None) or "-",
             getattr(session_snap, "machine_ip", "-"),
         )

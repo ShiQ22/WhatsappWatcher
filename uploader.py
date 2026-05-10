@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -24,6 +25,8 @@ from config import (
 )
 
 log = logging.getLogger("watcher.uploader")
+
+_STALE_PARTIAL_AGE_SECONDS = 7200  # 2 hours
 
 
 class UploadManager:
@@ -97,7 +100,7 @@ class UploadManager:
         row = self.storage.get_upload_by_local_and_dest(local_path, dest_rel_path)
         if not row:
             return False
-        return str(row["status"]).strip().lower() in {"pending", "failed", "uploaded"}
+        return str(row["status"]).strip().lower() in {"pending", "failed", "uploaded", "processing"}
 
     def _date_parts(self, when: Optional[datetime]) -> Tuple[str, str, str]:
         when = when or datetime.now()
@@ -119,10 +122,39 @@ class UploadManager:
         return str(Path(year) / month_name / day_folder / pc_user / UPLOAD_DAILY_REPORT_SUBDIR_NAME / local_name)
 
     def upload_for_session(self, session, call_local_id: Optional[int]) -> Optional[str]:
+        """
+        Called from the finalize thread immediately after a recording is ready.
+
+        The row is inserted with status='processing' so the background pending
+        scan never sees it as 'pending' — eliminating the duplicate-upload race.
+        If upload is disabled the row is inserted as 'pending' for later retry.
+        """
         local_path = getattr(session, "recording_path", None)
         if not local_path:
             return None
         dest_rel = self.plan_destination_rel_path(session, local_path)
+
+        if not UPLOAD_ENABLED or not UPLOAD_ROOT_DIR:
+            # Disabled — enqueue as pending so a later run can upload it.
+            upload_id = self.storage.enqueue_pending_upload(
+                call_local_id=call_local_id,
+                local_path=local_path,
+                dest_rel_path=dest_rel,
+                pc_user=getattr(session, "pc_user", None),
+                machine_name=getattr(session, "machine_name", None),
+                machine_ip=getattr(session, "machine_ip", None),
+                max_retries=UPLOAD_RETRY_COUNT,
+                initial_status="pending",
+            )
+            log.info(
+                "Uploader [FINALIZE-PATH]: share upload disabled; enqueued for later"
+                " | upload_id=%s | call_local_id=%s | local=%s",
+                upload_id, call_local_id, local_path,
+            )
+            return None
+
+        # Insert as 'processing' — background scan only picks up 'pending'/'failed'.
+        # This single INSERT is the ownership gate; no separate claim step is needed.
         upload_id = self.storage.enqueue_pending_upload(
             call_local_id=call_local_id,
             local_path=local_path,
@@ -131,15 +163,38 @@ class UploadManager:
             machine_name=getattr(session, "machine_name", None),
             machine_ip=getattr(session, "machine_ip", None),
             max_retries=UPLOAD_RETRY_COUNT,
+            initial_status="processing",
         )
-        if not UPLOAD_ENABLED or not UPLOAD_ROOT_DIR:
-            log.info("Uploader: share upload disabled; local file retained at %s", local_path)
-            return None
-        uploaded, error, attempts_used = self._process_one(local_path=local_path, dest_rel_path=dest_rel, retries_so_far=0)
+        log.info(
+            "Uploader [FINALIZE-PATH]: starting direct upload"
+            " | upload_id=%s | call_local_id=%s | local=%s | dest_rel=%s",
+            upload_id, call_local_id, local_path, dest_rel,
+        )
+
+        uploaded, error, attempts_used = self._process_one(
+            upload_id=upload_id,
+            local_path=local_path,
+            dest_rel_path=dest_rel,
+            retries_so_far=0,
+            path_label="FINALIZE-PATH",
+        )
         if uploaded:
             self.storage.mark_upload_success(upload_id, uploaded)
+            if call_local_id:
+                self.storage.update_uploaded_path(call_local_id, uploaded)
+            log.info(
+                "Uploader [FINALIZE-PATH]: upload succeeded"
+                " | upload_id=%s | call_local_id=%s | remote=%s",
+                upload_id, call_local_id, uploaded,
+            )
             return uploaded
+
         self.storage.mark_upload_failure(upload_id, attempts_used, error or "upload failed")
+        log.warning(
+            "Uploader [FINALIZE-PATH]: upload failed; row left for retry by pending scan"
+            " | upload_id=%s | call_local_id=%s | error=%s",
+            upload_id, call_local_id, error,
+        )
         return None
 
     def enqueue_report_file(self, report_path: Path, report_date: date) -> bool:
@@ -157,105 +212,214 @@ class UploadManager:
             machine_name=None,
             machine_ip=None,
             max_retries=UPLOAD_RETRY_COUNT,
+            initial_status="pending",
         )
         return True
 
     def process_pending_uploads(self) -> None:
+        """
+        Background scan — claims pending/failed rows atomically before processing.
+
+        After each successful upload, updates the linked call row's uploaded_path
+        so central sync reflects the upload regardless of which path uploaded it.
+        """
         if not UPLOAD_ENABLED or not UPLOAD_ROOT_DIR:
             return
+
+        # Reset rows stuck in 'processing' for longer than 15 minutes.
+        # This recovers rows where the process was killed mid-upload.
+        reset_count = self.storage.reset_stale_processing_uploads(stale_after_seconds=900)
+        if reset_count:
+            log.info(
+                "Uploader [PENDING-PATH]: reset %s stale processing row(s) to pending",
+                reset_count,
+            )
+
         rows = self.storage.get_pending_uploads()
         if not rows:
             return
+
         for row in rows:
+            upload_id = int(row["id"])
             local_path = row["local_path"]
             dest_rel_path = row["dest_rel_path"]
+            call_local_id = row["call_local_id"]
             retries = int(row["retries"] or 0)
             max_retries = int(row["max_retries"] or UPLOAD_RETRY_COUNT)
+
             if retries >= max_retries:
                 try:
                     local_file = Path(local_path)
                     if local_file.exists() and local_file.stat().st_size > 0:
                         log.info(
-                            "Uploader: resetting exhausted upload id=%s | local file now has content | path=%s | size=%s bytes",
-                            row["id"],
-                            local_path,
-                            local_file.stat().st_size,
+                            "Uploader [PENDING-PATH]: resetting exhausted upload;"
+                            " file now has content"
+                            " | upload_id=%s | local=%s | size=%s bytes",
+                            upload_id, local_path, local_file.stat().st_size,
                         )
-                        self.storage.mark_upload_pending_retry(int(row["id"]))
+                        self.storage.mark_upload_pending_retry(upload_id)
                         retries = 0
                     else:
                         continue
                 except Exception:
                     continue
+
+            # Atomically claim the row — only one worker can win per row.
+            if not self.storage.claim_upload_for_processing(upload_id):
+                log.debug(
+                    "Uploader [PENDING-PATH]: row already claimed by another worker"
+                    " | upload_id=%s",
+                    upload_id,
+                )
+                continue
+
+            log.info(
+                "Uploader [PENDING-PATH]: claimed upload for processing"
+                " | upload_id=%s | call_local_id=%s | local=%s"
+                " | dest_rel=%s | retries=%s/%s",
+                upload_id, call_local_id, local_path,
+                dest_rel_path, retries, max_retries,
+            )
+
             try:
-                uploaded, error, attempts_used = self._process_one(local_path=local_path, dest_rel_path=dest_rel_path, retries_so_far=retries)
+                uploaded, error, attempts_used = self._process_one(
+                    upload_id=upload_id,
+                    local_path=local_path,
+                    dest_rel_path=dest_rel_path,
+                    retries_so_far=retries,
+                    path_label="PENDING-PATH",
+                )
                 if uploaded:
-                    self.storage.mark_upload_success(int(row["id"]), uploaded)
+                    self.storage.mark_upload_success(upload_id, uploaded)
+                    if call_local_id:
+                        # update_uploaded_path already marks central_synced=0
+                        self.storage.update_uploaded_path(int(call_local_id), uploaded)
+                        log.info(
+                            "Uploader [PENDING-PATH]: updated call uploaded_path"
+                            " | upload_id=%s | call_local_id=%s | remote=%s",
+                            upload_id, call_local_id, uploaded,
+                        )
                 else:
-                    self.storage.mark_upload_failure(int(row["id"]), attempts_used, error or "upload failed")
+                    self.storage.mark_upload_failure(
+                        upload_id, attempts_used, error or "upload failed"
+                    )
             except Exception as exc:
                 log.exception(
-                    "[UPL-001] Uploader: pending upload processing failed"
-                    " | id=%s | local=%s | dest=%s",
-                    row["id"], local_path, dest_rel_path,
+                    "[UPL-001] Uploader [PENDING-PATH]: processing raised exception"
+                    " | upload_id=%s | call_local_id=%s | local=%s | dest_rel=%s",
+                    upload_id, call_local_id, local_path, dest_rel_path,
                 )
-                self.storage.mark_upload_failure(int(row["id"]), retries + 1, str(exc))
+                self.storage.mark_upload_failure(upload_id, retries + 1, str(exc))
 
-    def _process_one(self, *, local_path: str, dest_rel_path: str, retries_so_far: int) -> Tuple[Optional[str], Optional[str], int]:
+    def _process_one(
+        self,
+        *,
+        upload_id: int,
+        local_path: str,
+        dest_rel_path: str,
+        retries_so_far: int,
+        path_label: str = "UNKNOWN-PATH",
+    ) -> Tuple[Optional[str], Optional[str], int]:
         src = Path(local_path)
-        if not src.exists() or not src.is_file():
-            # Before declaring failure: check whether the remote destination already
-            # exists. This handles the stale-queue case where upload succeeded,
-            # local file was deleted, and the pending row is retried later.
-            if UPLOAD_ROOT_DIR:
-                try:
-                    dst_check = Path(UPLOAD_ROOT_DIR) / dest_rel_path
-                    if dst_check.exists() and dst_check.is_file() and dst_check.stat().st_size > 0:
-                        log.info(
-                            "Uploader: local missing but remote exists; marking uploaded"
-                            " | local=%s | remote=%s | size=%d bytes",
-                            src, dst_check, dst_check.stat().st_size,
-                        )
-                        return str(dst_check), None, retries_so_far
-                except Exception:
-                    pass  # share unreachable; fall through to real [UPL-004]
-            log.error("[UPL-004] Uploader: local file missing | path=%s", src)
-            message = f"[UPL-004] local file missing: {src}"
-            return None, message, retries_so_far + 1
-
         try:
-            src_size = src.stat().st_size
+            src_exists = src.exists() and src.is_file()
+            src_size = src.stat().st_size if src_exists else -1
         except OSError:
+            src_exists = False
             src_size = -1
 
         log.info(
-            "Uploader: preparing upload | src=%s | size=%s bytes | dest_rel=%s | retries_so_far=%s",
-            src,
-            src_size,
-            dest_rel_path,
-            retries_so_far,
+            "Uploader [%s]: preparing | upload_id=%s | retries_so_far=%s"
+            " | src=%s | src_exists=%s | src_size=%s bytes | dest_rel=%s",
+            path_label, upload_id, retries_so_far,
+            src, src_exists, src_size, dest_rel_path,
         )
+
+        if not src_exists:
+            # Before declaring failure: check if the remote destination already
+            # exists — handles stale-queue case where upload succeeded, local was
+            # deleted, and the row is retried by the pending scan.
+            if UPLOAD_ROOT_DIR:
+                try:
+                    dst_check = Path(UPLOAD_ROOT_DIR) / dest_rel_path
+                    dst_check_exists = dst_check.exists() and dst_check.is_file()
+                    dst_check_size = dst_check.stat().st_size if dst_check_exists else -1
+                    if dst_check_exists and dst_check_size > 0:
+                        log.info(
+                            "Uploader [%s]: local missing but remote exists — marking uploaded"
+                            " | upload_id=%s | local=%s | remote=%s | remote_size=%d bytes",
+                            path_label, upload_id, src, dst_check, dst_check_size,
+                        )
+                        return str(dst_check), None, retries_so_far
+                except Exception:
+                    pass  # share unreachable; fall through to [UPL-004]
+            log.error(
+                "[UPL-004] Uploader [%s]: local file missing"
+                " | upload_id=%s | path=%s",
+                path_label, upload_id, src,
+            )
+            return None, f"[UPL-004] local file missing: {src}", retries_so_far + 1
 
         try:
             self._ensure_share_access()
         except Exception:
             log.exception(
-                "[UPL-003] Uploader: share/authentication/path access failed"
-                " | dest_rel=%s",
-                dest_rel_path,
+                "[UPL-003] Uploader [%s]: share auth/access failed"
+                " | upload_id=%s | dest_rel=%s",
+                path_label, upload_id, dest_rel_path,
             )
             raise
+
         root = Path(UPLOAD_ROOT_DIR)
         dst = root / dest_rel_path
         dst.parent.mkdir(parents=True, exist_ok=True)
+
         last_error: Optional[str] = None
         attempts_used = retries_so_far
-        for attempt in range(retries_so_far + 1, UPLOAD_RETRY_COUNT + 1):
-            attempts_used = attempt
+
+        for attempt_num in range(retries_so_far + 1, UPLOAD_RETRY_COUNT + 1):
+            attempts_used = attempt_num
+
+            # Unique partial name per upload-id + attempt + pid.
+            # Two concurrent workers on the same file will never collide.
+            temp_dst = dst.with_name(
+                f"{dst.name}.upload-{upload_id}"
+                f".attempt-{attempt_num}"
+                f".pid-{os.getpid()}.partial"
+            )
+
+            # Remove stale partials (> 2 h old) for this destination.
+            # Wrapped in try/except — a cleanup failure must never block the upload.
             try:
-                temp_dst = dst.with_name(dst.name + ".partial")
+                stale_cutoff = time.time() - _STALE_PARTIAL_AGE_SECONDS
+                for old_partial in dst.parent.glob(f"{dst.name}.*.partial"):
+                    try:
+                        if old_partial.stat().st_mtime < stale_cutoff:
+                            old_partial.unlink()
+                            log.debug(
+                                "Uploader [%s]: removed stale partial | upload_id=%s | file=%s",
+                                path_label, upload_id, old_partial.name,
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                log.warning(
+                    "Uploader [%s]: stale partial cleanup failed (non-fatal)"
+                    " | upload_id=%s | dst=%s",
+                    path_label, upload_id, dst,
+                )
+
+            try:
                 if temp_dst.exists():
                     temp_dst.unlink()
+
+                log.info(
+                    "Uploader [%s]: copying to partial"
+                    " | upload_id=%s | attempt=%s/%s"
+                    " | src=%s | partial=%s",
+                    path_label, upload_id, attempt_num, UPLOAD_RETRY_COUNT,
+                    src, temp_dst.name,
+                )
                 shutil.copy2(str(src), str(temp_dst))
 
                 try:
@@ -264,10 +428,8 @@ class UploadManager:
                     temp_size = -1
 
                 log.info(
-                    "Uploader: copied to partial | src=%s | partial=%s | partial_size=%s bytes",
-                    src,
-                    temp_dst,
-                    temp_size,
+                    "Uploader [%s]: partial copied | upload_id=%s | partial_size=%s bytes",
+                    path_label, upload_id, temp_size,
                 )
 
                 if UPLOAD_VERIFY_COPY and not self._verify_copy(src, temp_dst):
@@ -275,31 +437,51 @@ class UploadManager:
 
                 if UPLOAD_VERIFY_COPY:
                     log.info(
-                        "Uploader: verification passed | src=%s | partial=%s",
-                        src,
-                        temp_dst,
+                        "Uploader [%s]: verification passed | upload_id=%s",
+                        path_label, upload_id,
                     )
 
                 if dst.exists():
                     dst.unlink()
 
                 temp_dst.replace(dst)
-                log.info("Uploader: partial renamed to final | %s -> %s", temp_dst, dst)
+                log.info(
+                    "Uploader [%s]: partial renamed to final"
+                    " | upload_id=%s | %s -> %s",
+                    path_label, upload_id, temp_dst.name, dst,
+                )
 
-                if DELETE_LOCAL_AFTER_SUCCESS and src.exists():
-                    src.unlink()
-                    log.info("Uploader: local source deleted after successful upload | %s", src)
+                if DELETE_LOCAL_AFTER_SUCCESS:
+                    try:
+                        if src.exists():
+                            src.unlink()
+                            log.info(
+                                "Uploader [%s]: local deleted after successful upload"
+                                " | upload_id=%s | src=%s",
+                                path_label, upload_id, src,
+                            )
+                    except Exception:
+                        log.warning(
+                            "Uploader [%s]: local delete failed (non-fatal)"
+                            " | upload_id=%s | src=%s",
+                            path_label, upload_id, src,
+                        )
 
-                log.info("Uploader: upload successful | %s -> %s", src, dst)
+                log.info(
+                    "Uploader [%s]: upload successful | upload_id=%s | %s -> %s",
+                    path_label, upload_id, src, dst,
+                )
                 return str(dst), None, attempts_used
+
             except Exception as exc:
                 last_error = str(exc)
                 log.exception(
-                    "[UPL-002] Uploader: upload attempt %s/%s failed"
-                    " | local=%s | remote=%s",
-                    attempt, UPLOAD_RETRY_COUNT, src, dst,
+                    "[UPL-002] Uploader [%s]: attempt %s/%s failed"
+                    " | upload_id=%s | local=%s | remote=%s",
+                    path_label, attempt_num, UPLOAD_RETRY_COUNT, upload_id, src, dst,
                 )
                 time.sleep(UPLOAD_RETRY_DELAY_SECONDS)
+
         return None, last_error, attempts_used
 
     @staticmethod

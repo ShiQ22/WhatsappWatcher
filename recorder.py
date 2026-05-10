@@ -2237,6 +2237,7 @@ class _HelperIpcBackend:
         self._merge_error:  Optional[str]  = None
         self._start_succeeded: bool        = False
         self._requested_base_name: Optional[str] = None
+        self._last_start_error_code: Optional[str] = None
 
         self._ready_evt   = threading.Event()
         self._started_evt = threading.Event()
@@ -2324,8 +2325,14 @@ class _HelperIpcBackend:
         except Exception:
             log.exception("[RH-002] IPC send failed | cmd=%s", cmd.get("cmd"))
 
+    @property
+    def is_session_active(self) -> bool:
+        """True while the helper subprocess considers a recording session open."""
+        return self._is_recording
+
     def start_session(self, output_dir: str, base_name: str) -> bool:
         self._start_succeeded = False
+        self._last_start_error_code = None
         self._requested_base_name = base_name
         self._started_evt.clear()
         self._merged_evt.clear()
@@ -2472,6 +2479,7 @@ class _HelperIpcBackend:
             msg  = evt.get("message", "")
             log.error("[RH-003] IPC error | code=%s | message=%s", code, msg)
             if code == "already_recording":
+                self._last_start_error_code = "already_recording"
                 with self._lock:
                     active = self._current_path or ""
                 requested = self._requested_base_name or ""
@@ -2530,6 +2538,12 @@ class Recorder:
         )
 
         self._lock = threading.RLock()
+        # Serialises start_recording / stop_recording / force_stop_recording so
+        # that a stop and a new start can never overlap at the Python level.
+        # All three methods are normally called from the single main-loop thread,
+        # so this lock adds zero contention in the normal path; it protects
+        # against any future cross-thread call (e.g. health-check restart).
+        self._transition_lock = threading.Lock()
 
         if RECORDER_BACKEND == "helper":
             self._helper: Optional[_HelperIpcBackend] = _HelperIpcBackend(
@@ -2623,12 +2637,13 @@ class Recorder:
     refresh_bandicam_paths = refresh_recorder_paths
 
     def start_recording(self) -> bool:
-        with self._lock:
-            if self._is_recording:
-                return False
+        with self._transition_lock:
+            with self._lock:
+                if self._is_recording:
+                    return False
 
-        if self._helper is not None:
-            return self._start_recording_helper()
+            if self._helper is not None:
+                return self._start_recording_helper()
 
         _t0 = time.monotonic()
         output_dir = RECORDER_OUTPUT_DIR
@@ -2734,12 +2749,13 @@ class Recorder:
         return True
 
     def stop_recording(self) -> bool:
-        with self._lock:
-            if not self._is_recording:
-                return False
+        with self._transition_lock:
+            with self._lock:
+                if not self._is_recording:
+                    return False
 
-        if self._helper is not None:
-            return self._stop_recording_helper()
+            if self._helper is not None:
+                return self._stop_recording_helper()
 
         self._engine.stop()
 
@@ -2754,8 +2770,9 @@ class Recorder:
         return True
 
     def force_stop_recording(self) -> bool:
-        if self._helper is not None:
-            return self._force_stop_recording_helper()
+        with self._transition_lock:
+            if self._helper is not None:
+                return self._force_stop_recording_helper()
 
         try:
             self._engine.stop()
@@ -2953,7 +2970,80 @@ class Recorder:
         now = datetime.now()
 
         if not self._helper.start_session(output_dir, base_name):
-            return False
+            # Recovery path: only attempt if the helper explicitly reported
+            # already_recording.  Other errors (bad_params, device_enum_failed,
+            # etc.) should not trigger a stop-and-retry cycle.
+            if self._helper._last_start_error_code != "already_recording":
+                log.error(
+                    "[RH] start_session failed | error=%s",
+                    self._helper._last_start_error_code,
+                )
+                return False
+
+            log.warning(
+                "[RH] start_session rejected (already_recording)"
+                " — previous session is still finishing;"
+                " waiting for helper to become idle before retry"
+                " | seg=%s | base=%s",
+                seg, base_name,
+            )
+
+            # Poll every 0.25 s up to 10 s total.
+            # Log a warning once if the wait exceeds 2 s so the log is
+            # informative without being spammy.
+            _t0 = time.monotonic()
+            _max_wait = 10.0
+            _poll = 0.25
+            _stopped = False
+            _logged_slow = False
+            while True:
+                remaining = _max_wait - (time.monotonic() - _t0)
+                if remaining <= 0:
+                    break
+                if self._helper.wait_for_stopped(timeout=min(_poll, remaining)):
+                    _stopped = True
+                    break
+                elapsed = time.monotonic() - _t0
+                if elapsed >= 2.0 and not _logged_slow:
+                    log.warning(
+                        "[RH] helper still active %.1fs after stop request"
+                        " — still waiting (max=%.0fs)",
+                        elapsed, _max_wait,
+                    )
+                    _logged_slow = True
+
+            if not _stopped:
+                log.error(
+                    "[RH] helper did not become idle within %.0fs"
+                    " — aborting start for new session | seg=%s",
+                    _max_wait, seg,
+                )
+                return False
+
+            _waited = time.monotonic() - _t0
+            log.info(
+                "[RH] helper became idle after %.2fs — retrying start | seg=%s",
+                _waited, seg,
+            )
+
+            # Use a fresh timestamp so the retried segment file name is unique.
+            ts_retry = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            base_name = f"{ts_retry}_seg{seg}"
+            now = datetime.now()
+            pre_snap = self._snapshot_output_dir(output_dir)
+
+            if not self._helper.start_session(output_dir, base_name):
+                log.error(
+                    "[RH] retry start failed after already_recording recovery"
+                    " | error=%s | seg=%s",
+                    self._helper._last_start_error_code, seg,
+                )
+                return False
+
+            log.info(
+                "[RH] retry start succeeded after recovery | seg=%s | base=%s",
+                seg, base_name,
+            )
 
         with self._lock:
             self._is_recording = True
