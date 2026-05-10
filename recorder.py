@@ -2478,17 +2478,10 @@ class _HelperIpcBackend:
             code = evt.get("code", "?")
             msg  = evt.get("message", "")
             if code == "already_recording":
-                # Log as WARNING — recovery in _start_recording_helper logs ERROR
-                # only if the recovery itself fails and the call is lost.
                 self._last_start_error_code = "already_recording"
                 with self._lock:
                     active = self._current_path or ""
                 requested = self._requested_base_name or ""
-                log.warning(
-                    "[RH] start rejected (already_recording)"
-                    " | active_path=%s | requested_base=%s",
-                    active, requested,
-                )
                 # Same-session duplicate: requested base_name is in the active path
                 # (shouldn't normally happen because Python checks _is_recording first,
                 # but handled defensively to avoid losing a valid in-progress recording)
@@ -2598,6 +2591,10 @@ class Recorder:
         self._last_mute_check: float = 0.0
         self._device_index: Optional[int] = None
         self._device_name_for_mute: str = ""
+
+        # already_recording fast-recovery throttle (< 1.0 s waits)
+        self._ar_fast_suppressed: int = 0
+        self._ar_fast_last_log_t: float = 0.0
 
         # Compatibility attributes — main.py reads these directly.
         # BANDICAM_PATH points to config.py (always exists) so the truthiness
@@ -2983,22 +2980,11 @@ class Recorder:
                 )
                 return False
 
-            log.warning(
-                "[RH] start_session rejected (already_recording)"
-                " — previous session is still finishing;"
-                " waiting for helper to become idle before retry"
-                " | seg=%s | base=%s",
-                seg, base_name,
-            )
-
-            # Poll every 0.25 s up to 10 s total.
-            # Log a warning once if the wait exceeds 2 s so the log is
-            # informative without being spammy.
+            # Poll every 0.25 s up to 10 s — single outcome log at the end.
             _t0 = time.monotonic()
             _max_wait = 10.0
             _poll = 0.25
             _stopped = False
-            _logged_slow = False
             while True:
                 remaining = _max_wait - (time.monotonic() - _t0)
                 if remaining <= 0:
@@ -3006,28 +2992,15 @@ class Recorder:
                 if self._helper.wait_for_stopped(timeout=min(_poll, remaining)):
                     _stopped = True
                     break
-                elapsed = time.monotonic() - _t0
-                if elapsed >= 2.0 and not _logged_slow:
-                    log.warning(
-                        "[RH] helper still active %.1fs after stop request"
-                        " — still waiting (max=%.0fs)",
-                        elapsed, _max_wait,
-                    )
-                    _logged_slow = True
+
+            _waited = time.monotonic() - _t0
 
             if not _stopped:
                 log.error(
-                    "[RH] helper did not become idle within %.0fs"
-                    " — aborting start for new session | seg=%s",
-                    _max_wait, seg,
+                    "[RH-003] already_recording recovery failed | waited=%.1fs | seg=%s",
+                    _waited, seg,
                 )
                 return False
-
-            _waited = time.monotonic() - _t0
-            log.info(
-                "[RH] helper became idle after %.2fs — retrying start | seg=%s",
-                _waited, seg,
-            )
 
             # Use a fresh timestamp so the retried segment file name is unique.
             ts_retry = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -3037,16 +3010,47 @@ class Recorder:
 
             if not self._helper.start_session(output_dir, base_name):
                 log.error(
-                    "[RH] retry start failed after already_recording recovery"
-                    " | error=%s | seg=%s",
-                    self._helper._last_start_error_code, seg,
+                    "[RH-003] already_recording recovery failed | waited=%.1fs"
+                    " | retry_error=%s | seg=%s",
+                    _waited, self._helper._last_start_error_code, seg,
                 )
                 return False
 
-            log.info(
-                "[RH] retry start succeeded after recovery | seg=%s | base=%s",
-                seg, base_name,
-            )
+            # Single outcome log per recovery.
+            # Slow (>= 1 s): always WARNING.  Fast (< 1 s): INFO, throttled to
+            # once per 5-minute window; extras counted and reported in the next log.
+            _AR_WINDOW = 300.0
+            _now_t = time.monotonic()
+            if _waited >= 1.0:
+                log.warning(
+                    "[RH] slow already_recording recovery | waited=%.2fs | seg=%s",
+                    _waited, seg,
+                )
+                if self._ar_fast_suppressed:
+                    log.info(
+                        "[RH] already_recording: %d fast recovery(s) not previously logged",
+                        self._ar_fast_suppressed,
+                    )
+                    self._ar_fast_suppressed = 0
+                    self._ar_fast_last_log_t = _now_t
+            else:
+                _since = _now_t - self._ar_fast_last_log_t
+                if self._ar_fast_last_log_t == 0.0 or _since >= _AR_WINDOW:
+                    if self._ar_fast_suppressed:
+                        log.info(
+                            "[RH] already_recording recovered | waited=%.2fs"
+                            " | +%d suppressed in last %.0fs | seg=%s",
+                            _waited, self._ar_fast_suppressed, _since, seg,
+                        )
+                    else:
+                        log.info(
+                            "[RH] already_recording recovered | waited=%.2fs | seg=%s",
+                            _waited, seg,
+                        )
+                    self._ar_fast_suppressed = 0
+                    self._ar_fast_last_log_t = _now_t
+                else:
+                    self._ar_fast_suppressed += 1
 
         with self._lock:
             self._is_recording = True
