@@ -3051,7 +3051,12 @@ class Recorder:
                         "[RH-VAL] Recording too short | duration=%.2fs | min=%.1fs | path=%s",
                         duration, _min_dur, path,
                     )
-                    # Keep WAV for diagnostics; do not rename or delete
+                    if not RECORDER_HELPER_KEEP_TEMP:
+                        try:
+                            Path(path).unlink(missing_ok=True)
+                            log.info("[RH-VAL] Deleted short rejected WAV | path=%s", path)
+                        except Exception:
+                            log.exception("[RH-VAL] Failed to delete short rejected WAV | path=%s", path)
                     with self._lock:
                         self._recording_success = False
                         self._recording_issues = "[RH-VAL] output too short"
@@ -3079,7 +3084,13 @@ class Recorder:
                         "[RH-VAL] MP3 output too small | size=%d bytes | min=%d | path=%s",
                         mp3_size, MIN_VALID_RECORDING_BYTES, mp3,
                     )
-                    # Keep both WAV and MP3 for diagnostics; do not upload
+                    if not RECORDER_HELPER_KEEP_TEMP:
+                        for _del in (mp3, path):
+                            try:
+                                Path(_del).unlink(missing_ok=True)
+                                log.info("[RH-VAL] Deleted small rejected file | path=%s", _del)
+                            except Exception:
+                                log.exception("[RH-VAL] Failed to delete rejected file | path=%s", _del)
                     with self._lock:
                         self._recording_success = False
                         self._recording_issues = "[RH-VAL] output too small"
@@ -3111,6 +3122,13 @@ class Recorder:
                         "[RH-VAL] MP3 output too small | size=%d bytes | min=%d | path=%s",
                         mp3_size, MIN_VALID_RECORDING_BYTES, mp3,
                     )
+                    if not RECORDER_HELPER_KEEP_TEMP:
+                        for _del in (mp3, path):
+                            try:
+                                Path(_del).unlink(missing_ok=True)
+                                log.info("[RH-VAL] Deleted small rejected file | path=%s", _del)
+                            except Exception:
+                                log.exception("[RH-VAL] Failed to delete rejected file | path=%s", _del)
                     with self._lock:
                         self._recording_success = False
                         self._recording_issues = "[RH-VAL] output too small"
