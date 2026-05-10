@@ -2477,14 +2477,15 @@ class _HelperIpcBackend:
         elif name == "error":
             code = evt.get("code", "?")
             msg  = evt.get("message", "")
-            log.error("[RH-003] IPC error | code=%s | message=%s", code, msg)
             if code == "already_recording":
+                # Log as WARNING — recovery in _start_recording_helper logs ERROR
+                # only if the recovery itself fails and the call is lost.
                 self._last_start_error_code = "already_recording"
                 with self._lock:
                     active = self._current_path or ""
                 requested = self._requested_base_name or ""
                 log.warning(
-                    "[RH] start rejected — already_recording"
+                    "[RH] start rejected (already_recording)"
                     " | active_path=%s | requested_base=%s",
                     active, requested,
                 )
@@ -2496,19 +2497,21 @@ class _HelperIpcBackend:
                     self._start_succeeded = True
                 # else: _start_succeeded stays False → start_session() returns False
                 self._started_evt.set()
-            elif code in ("bad_params", "device_enum_failed",
-                          "no_render_device", "output_dir_error"):
-                # _start_succeeded stays False → start_session() returns False
-                self._started_evt.set()
-            elif code == "not_recording":
-                # Helper has no active session; unblock any waiting stop/merge callers
-                # so they return immediately rather than waiting the full stop_timeout.
-                log.warning("[RH] stop rejected — not_recording | unblocking merged/stopped waiters")
-                self._stopped_evt.set()
-                self._merged_evt.set()
-            elif code == "capture_exception":
-                self._merged_evt.set()
-                self._stopped_evt.set()
+            else:
+                log.error("[RH-003] IPC error | code=%s | message=%s", code, msg)
+                if code in ("bad_params", "device_enum_failed",
+                            "no_render_device", "output_dir_error"):
+                    # _start_succeeded stays False → start_session() returns False
+                    self._started_evt.set()
+                elif code == "not_recording":
+                    # Helper has no active session; unblock any waiting stop/merge callers
+                    # so they return immediately rather than waiting the full stop_timeout.
+                    log.warning("[RH] stop rejected — not_recording | unblocking merged/stopped waiters")
+                    self._stopped_evt.set()
+                    self._merged_evt.set()
+                elif code == "capture_exception":
+                    self._merged_evt.set()
+                    self._stopped_evt.set()
 
         else:
             log.debug("[RH] Unknown event: %s", name)

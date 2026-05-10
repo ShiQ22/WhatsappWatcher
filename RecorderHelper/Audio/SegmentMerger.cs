@@ -43,7 +43,7 @@ public static class SegmentMerger
             try
             {
                 File.Copy(first, outputPath, overwrite: true);
-                Console.WriteLine($"[merge] Single segment — copied to {outputPath}");
+                Console.Error.WriteLine($"[merge] Single segment — copied to {outputPath}");
                 return true;
             }
             catch (Exception ex)
@@ -80,10 +80,10 @@ public static class SegmentMerger
                 while ((n = reader.Read(buf, 0, buf.Length)) > 0)
                     writer.Write(buf, 0, n);
 
-                Console.WriteLine($"[merge]   + {path}");
+                Console.Error.WriteLine($"[merge]   + {path}");
             }
 
-            Console.WriteLine($"[merge]   → {outputPath}");
+            Console.Error.WriteLine($"[merge]   → {outputPath}");
             return true;
         }
         catch (Exception ex)
