@@ -847,34 +847,6 @@ class WhatsAppDetector:
                       state.status_text, direction, _ended_hwnd)
             return result
 
-        # ── Stale ringing/connecting timeout ──────────────────────────────
-        # When ring was emitted but no answered proof exists and the call UI
-        # stops showing any strong proof for ≥ STALE_RINGING_TIMEOUT_SECONDS,
-        # the call is over (missed, cancelled, or window went stale).
-        if (
-            self._ring_event_emitted
-            and not self._session_answered_proof_seen
-            and self._last_strong_call_ui_ts > 0.0
-            and now_ts - self._last_strong_call_ui_ts >= STALE_RINGING_TIMEOUT_SECONDS
-        ):
-            direction = self._call_direction or "unknown"
-            number = self._caller_number
-            elapsed = now_ts - self._last_strong_call_ui_ts
-            _stale_result = DetectionResult(
-                CallEvent.ENDED, "detector",
-                f"session ended by stale ringing UI | dir={direction}",
-                caller_number=number, direction=direction,
-                hwnd=win.hwnd,
-            )
-            self._last_session_ended_ts = now_ts
-            self._last_ended_hwnd = win.hwnd
-            self._last_ended_ts = now_ts
-            self._last_ended_direction = direction
-            self._reset_internal_state()
-            log.debug("DETECTOR → stale ringing ended | last_strong=%.1fs | dir=%s",
-                      elapsed, direction)
-            return _stale_result
-
         # ── Emit ring event (first time window seen) ─────────────────────
         if not self._ring_event_emitted:
             # Never treat a "Call ended" window as a new call — return None so

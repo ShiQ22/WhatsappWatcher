@@ -2351,6 +2351,7 @@ class _HelperIpcBackend:
         if not self._started_evt.wait(self._START_TIMEOUT):
             log.error("[RH-002] 'started' event not received within %.0fs",
                       self._START_TIMEOUT)
+            self._last_start_error_code = "start_timeout"
             return False
         # True only when helper emitted "started"; False on any error response
         return self._start_succeeded
@@ -2503,6 +2504,8 @@ class _HelperIpcBackend:
                     self._stopped_evt.set()
                     self._merged_evt.set()
                 elif code == "capture_exception":
+                    self._last_start_error_code = "capture_exception"
+                    self._started_evt.set()
                     self._merged_evt.set()
                     self._stopped_evt.set()
 
@@ -2970,90 +2973,118 @@ class Recorder:
         now = datetime.now()
 
         if not self._helper.start_session(output_dir, base_name):
-            # Recovery path: only attempt if the helper explicitly reported
-            # already_recording.  Other errors (bad_params, device_enum_failed,
-            # etc.) should not trigger a stop-and-retry cycle.
-            if self._helper._last_start_error_code != "already_recording":
-                log.error(
-                    "[RH] start_session failed | error=%s",
-                    self._helper._last_start_error_code,
-                )
-                return False
-
-            # Poll every 0.25 s up to 10 s — single outcome log at the end.
-            _t0 = time.monotonic()
-            _max_wait = 10.0
-            _poll = 0.25
-            _stopped = False
-            while True:
-                remaining = _max_wait - (time.monotonic() - _t0)
-                if remaining <= 0:
-                    break
-                if self._helper.wait_for_stopped(timeout=min(_poll, remaining)):
-                    _stopped = True
-                    break
-
-            _waited = time.monotonic() - _t0
-
-            if not _stopped:
-                log.error(
-                    "[RH-003] already_recording recovery failed | waited=%.1fs | seg=%s",
-                    _waited, seg,
-                )
-                return False
-
-            # Use a fresh timestamp so the retried segment file name is unique.
-            ts_retry = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            base_name = f"{ts_retry}_seg{seg}"
-            now = datetime.now()
-            pre_snap = self._snapshot_output_dir(output_dir)
-
-            if not self._helper.start_session(output_dir, base_name):
-                log.error(
-                    "[RH-003] already_recording recovery failed | waited=%.1fs"
-                    " | retry_error=%s | seg=%s",
-                    _waited, self._helper._last_start_error_code, seg,
-                )
-                return False
-
-            # Single outcome log per recovery.
-            # Slow (>= 1 s): always WARNING.  Fast (< 1 s): INFO, throttled to
-            # once per 5-minute window; extras counted and reported in the next log.
-            # getattr guards against Recorder instances built via __new__ (e.g. tests).
-            _AR_WINDOW = 300.0
-            _now_t = time.monotonic()
-            _suppressed = getattr(self, "_ar_fast_suppressed", 0)
-            _last_log_t = getattr(self, "_ar_fast_last_log_t", 0.0)
-            if _waited >= 1.0:
+            err_code = self._helper._last_start_error_code
+            if err_code in ("capture_exception", "start_timeout"):
+                # Audio endpoint / USB failure at start — restart helper and retry once.
+                # One restart + one retry only; no loops.
                 log.warning(
-                    "[RH] slow already_recording recovery | waited=%.2fs | seg=%s",
-                    _waited, seg,
+                    "[RH] start_session failed | error=%s | restarting helper for retry",
+                    err_code,
                 )
-                if _suppressed:
-                    log.info(
-                        "[RH] already_recording: %d fast recovery(s) not previously logged",
-                        _suppressed,
+                if not self._restart_helper():
+                    log.error(
+                        "[RH] start retry aborted — helper restart failed | error=%s",
+                        err_code,
                     )
-                    self._ar_fast_suppressed = 0
-                    self._ar_fast_last_log_t = _now_t
-            else:
-                _since = _now_t - _last_log_t
-                if _last_log_t == 0.0 or _since >= _AR_WINDOW:
+                    return False
+                ts_retry = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                base_name = f"{ts_retry}_seg{seg}"
+                now = datetime.now()
+                pre_snap = self._snapshot_output_dir(output_dir)
+                if not self._helper.start_session(output_dir, base_name):
+                    log.error(
+                        "[RH] start retry failed after helper restart"
+                        " | orig_error=%s | retry_error=%s",
+                        err_code, self._helper._last_start_error_code,
+                    )
+                    return False
+                log.info(
+                    "[RH] RecorderHelper restarted and start retry succeeded"
+                    " | orig_error=%s",
+                    err_code,
+                )
+                # Falls through to context setup below.
+
+            elif err_code == "already_recording":
+                # Poll every 0.25 s up to 10 s — single outcome log at the end.
+                _t0 = time.monotonic()
+                _max_wait = 10.0
+                _poll = 0.25
+                _stopped = False
+                while True:
+                    remaining = _max_wait - (time.monotonic() - _t0)
+                    if remaining <= 0:
+                        break
+                    if self._helper.wait_for_stopped(timeout=min(_poll, remaining)):
+                        _stopped = True
+                        break
+
+                _waited = time.monotonic() - _t0
+
+                if not _stopped:
+                    log.error(
+                        "[RH-003] already_recording recovery failed | waited=%.1fs | seg=%s",
+                        _waited, seg,
+                    )
+                    return False
+
+                # Use a fresh timestamp so the retried segment file name is unique.
+                ts_retry = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                base_name = f"{ts_retry}_seg{seg}"
+                now = datetime.now()
+                pre_snap = self._snapshot_output_dir(output_dir)
+
+                if not self._helper.start_session(output_dir, base_name):
+                    log.error(
+                        "[RH-003] already_recording recovery failed | waited=%.1fs"
+                        " | retry_error=%s | seg=%s",
+                        _waited, self._helper._last_start_error_code, seg,
+                    )
+                    return False
+
+                # Single outcome log per recovery.
+                # Slow (>= 1 s): always WARNING.  Fast (< 1 s): INFO, throttled to
+                # once per 5-minute window; extras counted and reported in the next log.
+                # getattr guards against Recorder instances built via __new__ (e.g. tests).
+                _AR_WINDOW = 300.0
+                _now_t = time.monotonic()
+                _suppressed = getattr(self, "_ar_fast_suppressed", 0)
+                _last_log_t = getattr(self, "_ar_fast_last_log_t", 0.0)
+                if _waited >= 1.0:
+                    log.warning(
+                        "[RH] slow already_recording recovery | waited=%.2fs | seg=%s",
+                        _waited, seg,
+                    )
                     if _suppressed:
                         log.info(
-                            "[RH] already_recording recovered | waited=%.2fs"
-                            " | +%d suppressed in last %.0fs | seg=%s",
-                            _waited, _suppressed, _since, seg,
+                            "[RH] already_recording: %d fast recovery(s) not previously logged",
+                            _suppressed,
                         )
-                    else:
-                        log.info(
-                            "[RH] already_recording recovered | waited=%.2fs | seg=%s",
-                            _waited, seg,
-                        )
-                    self._ar_fast_suppressed = 0
-                    self._ar_fast_last_log_t = _now_t
+                        self._ar_fast_suppressed = 0
+                        self._ar_fast_last_log_t = _now_t
                 else:
-                    self._ar_fast_suppressed = _suppressed + 1
+                    _since = _now_t - _last_log_t
+                    if _last_log_t == 0.0 or _since >= _AR_WINDOW:
+                        if _suppressed:
+                            log.info(
+                                "[RH] already_recording recovered | waited=%.2fs"
+                                " | +%d suppressed in last %.0fs | seg=%s",
+                                _waited, _suppressed, _since, seg,
+                            )
+                        else:
+                            log.info(
+                                "[RH] already_recording recovered | waited=%.2fs | seg=%s",
+                                _waited, seg,
+                            )
+                        self._ar_fast_suppressed = 0
+                        self._ar_fast_last_log_t = _now_t
+                    else:
+                        self._ar_fast_suppressed = _suppressed + 1
+
+            else:
+                # Non-recoverable error: bad_params, device_enum_failed, etc.
+                log.error("[RH] start_session failed | error=%s", err_code)
+                return False
 
         with self._lock:
             self._is_recording = True
@@ -3101,6 +3132,31 @@ class Recorder:
 
         log.info("[RH] Force stop dispatched | segment=%s", self._segment_counter)
         return True
+
+    def _restart_helper(self) -> bool:
+        """Shut down the current RecorderHelper subprocess and launch a fresh one.
+
+        Called from _start_recording_helper() while _transition_lock is held,
+        so start/stop/restart cannot overlap.  Returns True on success.
+        """
+        try:
+            self._helper.shutdown()
+        except Exception:
+            log.exception("[RH] restart: shutdown failed")
+        try:
+            self._helper = _HelperIpcBackend(
+                exe_path=RECORDER_HELPER_PATH,
+                startup_timeout=RECORDER_HELPER_STARTUP_TIMEOUT,
+                stop_timeout=RECORDER_HELPER_STOP_TIMEOUT,
+                mic_gain=RECORDER_MIC_GAIN,
+                loopback_gain=RECORDER_LOOPBACK_GAIN,
+                keep_temp=RECORDER_HELPER_KEEP_TEMP,
+            )
+            log.info("[RH] RecorderHelper restarted successfully")
+            return True
+        except Exception:
+            log.exception("[RH] restart: failed to launch new helper")
+            return False
 
     def _resolve_final_files_helper(
         self, contexts: List[RecordingContext]
