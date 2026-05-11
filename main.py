@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -1004,6 +1005,61 @@ def _is_real_number(n) -> bool:
     return bool(s) and s not in ("-", "unknown")
 
 
+def _normalize_phone_number(n) -> str:
+    """Normalize a phone number to a pure digit string for comparison.
+
+    Converts leading '+' to '00', then strips all non-digit characters.
+    Returns '' for None, empty, or placeholder values.
+    """
+    if n is None:
+        return ""
+    s = str(n).strip()
+    if not s or s in ("-", "unknown"):
+        return ""
+    if s.startswith("+"):
+        s = "00" + s[1:]
+    return re.sub(r"\D", "", s)
+
+
+def _is_proven_direction(d: Optional[str]) -> bool:
+    """Return True only when d is a conclusively known direction."""
+    return d in ("incoming", "outgoing")
+
+
+def _is_same_call_continuation(
+    old_caller: Optional[str],
+    new_caller: Optional[str],
+    old_direction: Optional[str],
+    new_direction: Optional[str],
+) -> bool:
+    """Return True when a new ring event is a continuation of the same live call.
+
+    Rules:
+      Step 1 — caller identity (the anchor):
+        Both real and matching        → proceed to Step 2.
+        Both real but different       → False (different person).
+        Either or both missing/unknown → False (no identity anchor).
+      Step 2 — direction compatibility (only reached after Step 1 passes):
+        Both proven and conflicting   → False (incoming vs outgoing impossible).
+        All other combinations        → True.
+    """
+    old_norm = _normalize_phone_number(old_caller)
+    new_norm = _normalize_phone_number(new_caller)
+
+    # Step 1 — caller identity anchor required
+    if not old_norm or not new_norm:
+        return False
+    if old_norm != new_norm:
+        return False
+
+    # Step 2 — direction conflict check (only when both sides are proven)
+    if _is_proven_direction(old_direction) and _is_proven_direction(new_direction):
+        if old_direction != new_direction:
+            return False
+
+    return True
+
+
 def _save_session_latch(
     direction: str,
     hwnd: Optional[int],
@@ -1275,6 +1331,48 @@ def run() -> None:
                         )
                     )
                 )
+
+                # ── Session continuity: suppress false split for same-call hwnd/gen change ──
+                # Only fires when all of: split is pending, a live session exists, the recorder
+                # is actively recording, and the split trigger is hwnd or generation change.
+                # Ringing-state splits and splits from IDLE are never suppressed.
+                if (
+                    split_needed
+                    and is_live_session
+                    and recorder.is_recording
+                    and (different_hwnd or different_generation)
+                ):
+                    _cont_current_number = sm.session.caller_number or _session_number_latch
+                    _cont_current_dir = (
+                        sm.session.direction
+                        if _is_proven_direction(sm.session.direction)
+                        else _session_direction_latch
+                        if _is_proven_direction(_session_direction_latch)
+                        else sm.session.direction
+                    )
+                    _cont_new_dir = (
+                        new_dir if _is_proven_direction(new_dir) else result.direction
+                    )
+                    if _is_same_call_continuation(
+                        _cont_current_number,
+                        result.caller_number,
+                        _cont_current_dir,
+                        _cont_new_dir,
+                    ):
+                        _cont_old_hwnd = current_session_hwnd
+                        _cont_old_gen = current_session_generation
+                        split_needed = False
+                        current_session_hwnd = result_hwnd
+                        current_session_generation = getattr(result, "session_generation", 0)
+                        log.info(
+                            "SESSION CONTINUITY → hwnd/gen changed but same call preserved"
+                            " | old_hwnd=%s | new_hwnd=%s | old_gen=%s | new_gen=%s"
+                            " | dir=%s | number=%s",
+                            _cont_old_hwnd, current_session_hwnd,
+                            _cont_old_gen, current_session_generation,
+                            _cont_current_dir or "unknown",
+                            _cont_current_number or "-",
+                        )
 
                 if split_needed:
                     split_snap = copy.deepcopy(sm.session)  # snapshot before any mutation
